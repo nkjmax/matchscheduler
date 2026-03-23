@@ -1,0 +1,5 @@
+config.json
+matches.db
+__pycache__/
+*.pyc
+.venv/
