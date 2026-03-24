@@ -178,15 +178,20 @@ async def do_archive(client, match_id, concluded: bool):
     Posts summary to archive channel, creates archive thread with message log,
     then locks and archives the original thread.
     """
+    import logging
+    log = logging.getLogger("discord")
+
     match   = await db.get_match(match_id)
     signups = await db.get_signups_for_match(match_id)
 
     archive_channel_id = client.config.get("archive_channel_id")
     if not archive_channel_id:
+        log.warning("do_archive: no archive_channel_id in config")
         return
 
     archive_ch = client.get_channel(int(archive_channel_id))
     if not archive_ch:
+        log.warning(f"do_archive: could not find archive channel {archive_channel_id}")
         return
 
     status_line = "🏁 Concluded" if concluded else "❌ Cancelled"
@@ -205,9 +210,12 @@ async def do_archive(client, match_id, concluded: bool):
             thread = client.get_channel(match["thread_id"])
             if not thread:
                 thread = await client.fetch_channel(match["thread_id"])
-            await thread.edit(archived=True, locked=True)
-        except Exception:
-            pass
+            if thread:
+                await thread.edit(locked=True)
+                await thread.edit(archived=True)
+        except Exception as e:
+            import logging
+            logging.getLogger("discord").warning(f"Failed to lock/archive thread {match['thread_id']}: {e}")
 
 
 async def do_cancel(client, match_id):
@@ -241,7 +249,10 @@ async def do_cancel(client, match_id):
         except Exception:
             pass
 
-    # Archive before ending
+    # Mark as ended FIRST so channel is freed up regardless of archive success
+    await db.end_match(match_id)
+
+    # Archive (best effort — errors won't block the cancel)
     await do_archive(client, match_id, concluded=False)
 
     cancel_embed = discord.Embed(
@@ -261,8 +272,6 @@ async def do_cancel(client, match_id):
             embed=cancel_embed,
         )
         await db.cancel_match(match_id, notice.id)
-    else:
-        await db.end_match(match_id)
 
     return True
 
@@ -687,10 +696,11 @@ class ConcludeConfirmView(ui.View):
             )
             await db.set_conclude_msg(self.match_id, conclude_msg.id, match["channel_id"])
 
-        # Archive summary + thread messages to archive channel
-        await do_archive(interaction.client, self.match_id, concluded=True)
-
+        # Mark as ended FIRST so channel is freed regardless of archive success
         await db.end_match(self.match_id)
+
+        # Archive (best effort)
+        await do_archive(interaction.client, self.match_id, concluded=True)
         await interaction.followup.send("✅ Match concluded and archived.", ephemeral=True)
 
     @ui.button(label="Never mind", style=discord.ButtonStyle.secondary)

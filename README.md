@@ -1,25 +1,36 @@
 # TF2 Match Scheduler Bot
 
-A Discord bot for scheduling and managing TF2 Highlander mix matches with sign-ups, roster management, and automatic cleanup.
+A Discord bot for scheduling and managing TF2 Highlander mix matches. Handles the full lifecycle of a mix — from scheduling to sign-ups, roster management, connect strings, and archiving.
+
+---
+
+## Commands
+
+| Command | Who can use | Description |
+|---|---|---|
+| `/host` | Hoster role | Schedule a new match |
+| `/manage` | Hoster role | Open the manage panel for the active match in this channel |
+| `/edit` | Hoster role | Edit match details or host team roster |
+| `/connect-string` | Hoster role | Paste server info and post connect strings to the channel |
+| `/ping` | Hoster role | Ping the pug role asking for more players |
 
 ---
 
 ## Features
 
-- `/host` — Schedule a Highlander mix (game mode → match type → division → modal)
-- `/manage` — Open the manage panel for the active match in a channel
-- `/edit-match` — Edit match details (time, map, server, etc.)
-- `/edit-roster` — Edit a specific slot in the host team roster
-- `/connect-string` — Parse and post server connect strings
-- `/ping` — Ping the pug role asking for players
-- Sign-up buttons with per-class accept/deny panel
-- Sign-out button with last-hour warning
-- Multi-class sign-ups per player
-- Clash detection across concurrent mixes
-- Auto thread creation per match
-- Archive on conclusion/cancellation
-- 1-hour match reminder pinging accepted players
-- 8-hour host reminder in the hoster channel
+- **3-step scheduling flow** — game mode → match type → division → modal
+- **Host team roster input** — type comma-separated @mentions directly in the mix channel after scheduling
+- **Multi-class sign-ups** — players can sign up for multiple classes simultaneously
+- **Re-signup after denial** — denied players can sign up on a different class without signing out
+- **Clash detection** — warns players and notifies hosters if a player signs up for overlapping mixes (±1.5h window)
+- **LP priority system** — non-LP players automatically take priority over LP players on the main roster
+- **Live ongoing-matches line** — updates in real time with roster count and missing class emojis
+- **Review panel** — class dropdown → player buttons to accept. Pending players listed chronologically
+- **Sub promotion** — when a rostered player signs out, the highest-priority sub is promoted automatically and pinged in the thread
+- **Connect string parser** — paste the full server bot message, bot extracts and posts connect/SDR/SourceTV strings
+- **Archive on conclude/cancel** — posts summary + thread log to archive channel, locks original thread, cleans up all bot messages
+- **24h notices** — cancellation and conclusion notices auto-delete after 24 hours
+- **Reminders** — 1h before match pings rostered players; 8h after start pings original hoster to conclude
 
 ---
 
@@ -34,12 +45,11 @@ pip install -r requirements.txt
 ### 2. Create your Discord bot
 
 1. Go to https://discord.com/developers/applications → New Application
-2. Bot → Add Bot
+2. Bot → Add Bot → copy the token
 3. Enable **Message Content Intent** and **Server Members Intent**
-4. Copy the token
-5. OAuth2 → URL Generator — scopes: `bot`, `applications.commands`
-6. Bot permissions: `Send Messages`, `Embed Links`, `Read Message History`, `Manage Messages`, `Create Public Threads`
-7. Invite the bot to your server
+4. OAuth2 → URL Generator — scopes: `bot`, `applications.commands`
+5. Bot permissions: `Send Messages`, `Embed Links`, `Read Message History`, `Manage Messages`, `Create Public Threads`
+6. Invite the bot to your server
 
 ### 3. Configure
 
@@ -54,14 +64,10 @@ Create `config.json` (not committed to git):
     "hoster_channel_id": "CHANNEL_ID",
     "hoster_role_id": "ROLE_ID",
     "pug_role_id": "ROLE_ID",
+    "lp_role_id": "ROLE_ID",
     "mix_channels": [
-        "MIX_SCRIMS_1_ID",
-        "MIX_SCRIMS_2_ID",
-        "MIX_SCRIMS_3_ID",
-        "MIX_SCRIMS_4_ID",
-        "MIX_SCRIMS_5_ID",
-        "MIX_SCRIMS_6_ID",
-        "MIX_SCRIMS_7_ID"
+        "MIX_CHANNEL_1_ID",
+        "MIX_CHANNEL_2_ID"
     ],
     "re_sort_enabled": false,
     "re_sort_interval_minutes": 30
@@ -82,51 +88,32 @@ python main.py
 
 ```
 matchscheduler/
-├── main.py         — Bot entry point, on_message handler
-├── db.py           — SQLite helpers
-├── embeds.py       — Message builders and constants
-├── views.py        — All Discord UI (buttons, selects, modals)
-├── schedule.py     — Slash commands (/host, /edit-match, /ping, etc.)
+├── main.py         — Bot entry, on_message handler (roster input, connect string)
+├── db.py           — SQLite CRUD helpers
+├── embeds.py       — Message builders and class constants
+├── views.py        — All Discord UI (buttons, selects, modals, views)
+├── schedule.py     — Slash commands and ongoing-matches helpers
 ├── manage.py       — /manage command
-├── scheduler.py    — Background jobs (reminders, cleanup)
-├── config.json     — Your config (do not commit)
+├── scheduler.py    — Background reminder and cleanup jobs
+├── config.json     — Config (do not commit to git)
 ├── requirements.txt
 └── matches.db      — Auto-created SQLite database
 ```
 
 ---
 
-## Deployment (Oracle Cloud Free Tier)
+## Deployment
+
+The bot is designed to run as a systemd service on a Linux VPS. After cloning and configuring:
 
 ```bash
-# Clone on server
-git clone https://github.com/YOURUSERNAME/matchscheduler.git
-cd matchscheduler
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+```
 
-# Create config.json manually (not in git)
-nano config.json
-
-# Run as a service
-sudo systemctl enable discordbot
-sudo systemctl start discordbot
-
-# Update
+To update:
+```bash
 git pull
 sudo systemctl restart discordbot
 ```
-
----
-
-## Commands
-
-| Command | Description |
-|---|---|
-| `/host` | Schedule a new match |
-| `/manage` | Manage the active match in this channel |
-| `/edit-match` | Edit match details |
-| `/edit-roster` | Edit a host team roster slot |
-| `/connect-string` | Post server connect strings |
-| `/ping` | Ping for more players |
