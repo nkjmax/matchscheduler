@@ -8,6 +8,77 @@ import db
 LOW_PRIORITY_ROLE_ID = None  # set to your role ID integer if desired
 
 
+async def is_lp(client, user_id):
+    """Check if a user has the LP role."""
+    lp_role_id = getattr(client, "config", {}).get("lp_role_id")
+    if not lp_role_id:
+        return False
+    guild_id = getattr(client, "config", {}).get("guild_id")
+    if not guild_id:
+        return False
+    try:
+        guild  = client.get_guild(int(guild_id))
+        member = guild.get_member(user_id) or await guild.fetch_member(user_id)
+        return any(str(r.id) == str(lp_role_id) for r in member.roles)
+    except Exception:
+        return False
+
+
+async def reorder_class_roster(client, match_id, class_name):
+    """
+    After any accept, ensure non-LP players have priority over LP players.
+    If main roster slot is LP but a non-LP sub exists, swap them.
+    """
+    accepted = await db.get_accepted_signups_for_class(match_id, class_name)
+    if len(accepted) < 2:
+        return  # Only one player, nothing to reorder
+
+    # Check LP status for each
+    lp_status = {}
+    for s in accepted:
+        lp_status[s["id"]] = await is_lp(client, s["user_id"])
+
+    main_roster = accepted[0]  # First accepted = main roster
+    subs        = accepted[1:]
+
+    # If main roster is LP, find first non-LP sub to swap with
+    if lp_status[main_roster["id"]]:
+        non_lp_sub = next((s for s in subs if not lp_status[s["id"]]), None)
+        if non_lp_sub:
+            # Swap: demote main to sub order (move to after last LP sub),
+            # promote non_lp_sub to main by swapping their signup IDs
+            # We do this by updating the id ordering — easiest is to
+            # re-insert: delete main, re-insert at end, so non_lp_sub becomes first
+            async with __import__('aiosqlite').connect(__import__('db').DB_PATH) as adb:
+                # Get the main roster signup details
+                await adb.execute(
+                    "UPDATE signups SET id = id WHERE id = ?",
+                    (main_roster["id"],)
+                )
+                # Swap IDs by updating timestamps — use a temp value
+                # Actually simplest: change the signup order by re-inserting
+                # Get full rows
+                main_data = dict(main_roster)
+                sub_data  = dict(non_lp_sub)
+
+                # Delete both
+                await adb.execute("DELETE FROM signups WHERE id IN (?, ?)",
+                    (main_data["id"], sub_data["id"]))
+
+                # Re-insert non-LP first (gets lower auto-increment), LP second
+                await adb.execute(
+                    "INSERT INTO signups (match_id, user_id, username, class_name, team, status) VALUES (?,?,?,?,?,?)",
+                    (sub_data["match_id"], sub_data["user_id"], sub_data["username"],
+                     sub_data["class_name"], sub_data["team"], sub_data["status"])
+                )
+                await adb.execute(
+                    "INSERT INTO signups (match_id, user_id, username, class_name, team, status) VALUES (?,?,?,?,?,?)",
+                    (main_data["match_id"], main_data["user_id"], main_data["username"],
+                     main_data["class_name"], main_data["team"], main_data["status"])
+                )
+                await adb.commit()
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 async def refresh_message(client, match_id):
@@ -25,6 +96,13 @@ async def refresh_message(client, match_id):
             await msg.edit(content=build_mix_message(match, signups, pug_role_id=pug_role_id), embed=None)
         else:
             await msg.edit(embed=build_match_embed(match, signups))
+    except Exception:
+        pass
+
+    # Also refresh the ongoing-matches line
+    try:
+        from schedule import refresh_ongoing_line
+        await refresh_ongoing_line(client, match_id)
     except Exception:
         pass
 
@@ -736,6 +814,64 @@ class ClassDropdownSelect(ui.Select):
         await interaction.response.edit_message(content=text, view=view)
 
 
+class LPConfirmView(ui.View):
+    def __init__(self, match_id, signup_id, username, class_name, filled):
+        super().__init__(timeout=60)
+        self.match_id   = match_id
+        self.signup_id  = signup_id
+        self.username   = username
+        self.class_name = class_name
+        self.filled     = filled
+
+    @ui.button(label="Yes, accept anyway", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction, button):
+        current = await db.get_signup_by_id(self.signup_id)
+        already = current and current["status"] == "accepted"
+        await _do_accept(interaction, self.match_id, self.signup_id, self.username, self.class_name, self.filled, already, current)
+
+    @ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction, button):
+        await interaction.response.edit_message(content="Cancelled.", view=None)
+
+
+async def _do_accept(interaction, match_id, signup_id, username, class_name, filled, already, current):
+    await db.update_signup_status(signup_id, "accepted")
+
+    is_main_roster = filled == 0 and not already
+    if is_main_roster:
+        user_id = current["user_id"] if current else None
+        if user_id:
+            await db.remove_sub_slots_for_user(match_id, user_id, class_name)
+
+    # Reorder roster so non-LP players have priority over LP players
+    await reorder_class_roster(interaction.client, match_id, class_name)
+    await refresh_message(interaction.client, match_id)
+
+    # Check actual position after reorder to determine if on main roster or sub
+    accepted_after = await db.get_accepted_signups_for_class(match_id, class_name)
+    user_id = current["user_id"] if current else None
+    on_main = len(accepted_after) > 0 and accepted_after[0]["user_id"] == user_id
+    result = "accepted on " + class_name if on_main else "added as sub"
+    await interaction.response.send_message(
+        "✅  " + username + " — " + result + ".", ephemeral=True
+    )
+
+    # Refresh class view
+    try:
+        pending    = await db.get_pending_signups(match_id)
+        class_pend = sorted([s for s in pending if s["class_name"] == class_name], key=lambda s: s["id"])
+        if class_pend:
+            view = PlayerPickView(match_id, class_name, class_pend)
+            text = "**" + class_name + "**  —  click a player to accept"
+            await interaction.message.edit(content=text, view=view)
+        else:
+            view = await ReviewView.create(match_id)
+            text, _ = await build_manage_text(match_id)
+            await interaction.message.edit(content=text, view=view)
+    except Exception:
+        pass
+
+
 class PlayerPickView(ui.View):
     """Shows pending players as plain buttons — click to accept, no deny needed here."""
     def __init__(self, match_id, class_name, pending_signups):
@@ -769,21 +905,19 @@ class AcceptPlayerButton(ui.Button):
         current = await db.get_signup_by_id(self.signup_id)
         already = current and current["status"] == "accepted"
         filled  = await db.count_accepted_for_class(self.match_id, self.class_name)
-        await db.update_signup_status(self.signup_id, "accepted")
 
-        is_main_roster = filled == 0 and not already  # first accepted = main roster
-        if is_main_roster:
-            # Remove all other accepted sub slots for this player
-            user_id = current["user_id"] if current else None
-            if user_id:
-                await db.remove_sub_slots_for_user(self.match_id, user_id, self.class_name)
+        # LP warning — show confirm before accepting if player has LP role
+        user_id    = current["user_id"] if current else None
+        player_lp  = await is_lp(interaction.client, user_id) if user_id else False
+        if player_lp and not already:
+            view = LPConfirmView(self.match_id, self.signup_id, self.username, self.class_name, filled)
+            await interaction.response.send_message(
+                "⚠️ **" + self.username + "** currently has the Low Priority role. Are you sure you want to accept them?",
+                view=view, ephemeral=True,
+            )
+            return
 
-        await refresh_message(interaction.client, self.match_id)
-
-        result = "added as sub" if (filled >= 1 and not already) else "accepted on " + self.class_name
-        await interaction.response.send_message(
-            "✅  " + self.username + " — " + result + ".", ephemeral=True
-        )
+        await _do_accept(interaction, self.match_id, self.signup_id, self.username, self.class_name, filled, already, current)
 
         # Refresh the class view (message may have been dismissed — ignore if so)
         try:

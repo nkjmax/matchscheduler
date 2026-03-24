@@ -88,10 +88,28 @@ async def post_to_ongoing(bot, match_id, channel_id):
     ongoing_channel = bot.get_channel(bot.ongoing_channel)
     if not ongoing_channel:
         return
-    match = await db.get_match(match_id)
-    line  = build_ongoing_line(match, channel_id=channel_id)
-    msg   = await ongoing_channel.send(line)
+    match   = await db.get_match(match_id)
+    signups = await db.get_signups_for_match(match_id)
+    line    = build_ongoing_line(match, channel_id=channel_id, signups=signups)
+    msg     = await ongoing_channel.send(line)
     await db.set_ongoing_msg_id(match_id, msg.id)
+
+
+async def refresh_ongoing_line(bot, match_id):
+    """Update the ongoing-matches line whenever the mix roster changes."""
+    match = await db.get_match(match_id)
+    if not match or not match["ongoing_msg_id"]:
+        return
+    ongoing_channel = bot.get_channel(bot.ongoing_channel)
+    if not ongoing_channel:
+        return
+    try:
+        msg     = await ongoing_channel.fetch_message(match["ongoing_msg_id"])
+        signups = await db.get_signups_for_match(match_id)
+        line    = build_ongoing_line(match, channel_id=match["channel_id"], signups=signups)
+        await msg.edit(content=line)
+    except Exception:
+        pass
 
 
 # ── Step 1: Game mode select ─────────────────────────────────────────────────
@@ -424,6 +442,34 @@ class PugModal(ui.Modal, title="Schedule a PUG (9v9)"):
 
 # ── Cog ───────────────────────────────────────────────────────────────────────
 
+# ── Edit select ───────────────────────────────────────────────────────────────
+
+class EditSelectView(ui.View):
+    def __init__(self, match_id, bot):
+        super().__init__(timeout=60)
+        self.match_id = match_id
+        self.bot      = bot
+        select = ui.Select(
+            placeholder="Select what to edit...",
+            options=[
+                discord.SelectOption(label="Match details", value="match", description="Time, map, server, notes"),
+                discord.SelectOption(label="Host team roster", value="roster", description="Edit a class slot"),
+            ]
+        )
+        select.callback = self._on_select
+        self.add_item(select)
+
+    async def _on_select(self, interaction):
+        choice = interaction.data["values"][0]
+        if choice == "match":
+            await interaction.response.send_modal(EditMixModal(self.match_id, self.bot))
+        else:
+            view = EditRosterClassSelect(self.match_id, self.bot)
+            await interaction.response.edit_message(
+                content="Which class slot would you like to edit?", view=view
+            )
+
+
 # ── Edit roster class select ──────────────────────────────────────────────────
 
 class EditRosterClassSelect(ui.View):
@@ -622,8 +668,8 @@ class ScheduleCog(commands.Cog):
             ephemeral=True,
         )
 
-    @app_commands.command(name="edit-match", description="Edit the match details in this channel.")
-    async def edit_match(self, interaction):
+    @app_commands.command(name="edit", description="Edit match details or host team roster.")
+    async def edit(self, interaction):
         if not is_hoster(interaction):
             await interaction.response.send_message(
                 "❌ You need the hoster role to use this command.", ephemeral=True
@@ -635,26 +681,12 @@ class ScheduleCog(commands.Cog):
                 "❌ No active match in this channel.", ephemeral=True
             )
             return
-        await interaction.response.send_modal(EditMixModal(match["id"], self.bot))
-
-    @app_commands.command(name="edit-roster", description="Edit a player in the host team roster.")
-    async def edit_roster(self, interaction):
-        if not is_hoster(interaction):
-            await interaction.response.send_message(
-                "❌ You need the hoster role to use this command.", ephemeral=True
-            )
-            return
-        match = await db.get_match_by_channel(interaction.channel_id)
-        if not match:
-            await interaction.response.send_message(
-                "❌ No active match in this channel.", ephemeral=True
-            )
-            return
-        view = EditRosterClassSelect(match["id"], self.bot)
+        view = EditSelectView(match["id"], self.bot)
         await interaction.response.send_message(
-            "Which class slot would you like to edit?",
-            view=view, ephemeral=True,
+            "What would you like to edit?", view=view, ephemeral=True
         )
+
+
 
     @app_commands.command(name="connect-string", description="Parse and post server connect strings.")
     async def connect_string(self, interaction):

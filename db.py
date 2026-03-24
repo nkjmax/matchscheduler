@@ -483,3 +483,20 @@ async def get_match_by_id_for_user(user_id, match_id):
             (match_id, user_id)
         ) as cur:
             return await cur.fetchone()
+
+async def get_accepted_signups_for_class_ordered(match_id, class_name):
+    """
+    Returns accepted signups for a class in priority order:
+    non-LP first (by signup time), then LP (by signup time).
+    Requires lp_user_ids set to be passed for sorting — returns raw list here,
+    sorting is done in views.py where we have guild context.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT * FROM signups
+               WHERE match_id=? AND class_name=? AND status='accepted'
+               ORDER BY id ASC""",
+            (match_id, class_name)
+        ) as cur:
+            return await cur.fetchall()

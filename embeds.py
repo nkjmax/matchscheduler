@@ -179,7 +179,7 @@ def build_archive_message(match, signups):
     )
 
 
-def build_ongoing_line(match, guild_id=None, channel_id=None):
+def build_ongoing_line(match, guild_id=None, channel_id=None, signups=None):
     ts          = match["timestamp"]
     ts_full     = f"<t:{ts}:F>" if ts else "tbc"
     ts_rel      = f"<t:{ts}:R>" if ts else ""
@@ -191,7 +191,25 @@ def build_ongoing_line(match, guild_id=None, channel_id=None):
         label = f"**{team_name}** vs Mix | HL | {ts_full}  {ts_rel}"
     else:
         label = f"**{team_name} PUG** | HL | {ts_full}  {ts_rel}"
-    return f"> {label} | {chan_mention}"
+
+    line1 = f"> {label} | {chan_mention}"
+
+    # Build roster status line
+    if signups is not None:
+        filled_classes = set()
+        for s in signups:
+            if s["status"] == "accepted" and s["class_name"] not in filled_classes:
+                filled_classes.add(s["class_name"])
+        count    = len(filled_classes)
+        missing  = [cls for cls in TF2_CLASSES if cls not in filled_classes]
+        if missing:
+            missing_emojis = " ".join(CLASS_EMOJI[cls] for cls in missing)
+            line2 = f"> Mix roster: {count}/9 filled. Classes required: {missing_emojis}"
+        else:
+            line2 = f"> Mix roster: 9/9 filled."
+        return line1 + "\n" + line2
+
+    return line1
 
 
 def build_match_embed(match, signups):
