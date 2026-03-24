@@ -2,7 +2,7 @@ import time
 import discord
 from discord import ui
 
-from embeds import TF2_CLASSES, CLASS_EMOJI, build_mix_message, build_match_embed, build_archive_message
+from embeds import TF2_CLASSES, CLASS_EMOJI, build_mix_message, build_match_embed, build_archive_message, build_opug_teams_message, build_split_view_text
 import db
 
 LOW_PRIORITY_ROLE_ID = None  # set to your role ID integer if desired
@@ -94,6 +94,10 @@ async def refresh_message(client, match_id):
         if match["type"] == "mix":
             pug_role_id = getattr(client, "config", {}).get("pug_role_id")
             await msg.edit(content=build_mix_message(match, signups, pug_role_id=pug_role_id), embed=None)
+        elif match["type"] == "opug":
+            from embeds import build_opug_message
+            pug_role_id = getattr(client, "config", {}).get("pug_role_id")
+            await msg.edit(content=build_opug_message(match, signups, pug_role_id=pug_role_id), embed=None)
         else:
             await msg.edit(embed=build_match_embed(match, signups))
     except Exception:
@@ -172,17 +176,18 @@ async def archive_thread_to_channel(client, match, archive_ch, archive_summary_m
                 pass
 
 
-async def do_archive(client, match_id, concluded: bool):
+async def do_archive(client, match_id, concluded: bool, opug_split=None):
     """
     Shared archive logic for both conclude and cancel.
     Posts summary to archive channel, creates archive thread with message log,
     then locks and archives the original thread.
+    opug_split: {"red": [...], "blu": [...], "subs": [...]} for concluded opugs
     """
     import logging
     log = logging.getLogger("discord")
 
     match   = await db.get_match(match_id)
-    signups = await db.get_signups_for_match(match_id)
+    signups = await db.get_signups_for_match(match_id) if opug_split is None else opug_split
 
     archive_channel_id = client.config.get("archive_channel_id")
     if not archive_channel_id:
@@ -616,6 +621,63 @@ async def _do_signup(interaction, match_id, class_name):
     await refresh_message(interaction.client, match_id)
 
 
+# ── Organised PUG sign-up view ────────────────────────────────────────────────
+
+class OPugClassButton(ui.Button):
+    def __init__(self, class_name, match_id):
+        super().__init__(
+            label=class_name,
+            emoji=CLASS_EMOJI[class_name],
+            custom_id=f"opug_signup:{match_id}:{class_name}",
+            style=discord.ButtonStyle.secondary,
+            row=TF2_CLASSES.index(class_name) // 5,
+        )
+        self.class_name = class_name
+        self.match_id   = match_id
+
+    async def callback(self, interaction):
+        await interaction.response.defer(ephemeral=True)
+        match = await db.get_match(self.match_id)
+
+        if not match or match["ended"]:
+            await interaction.followup.send(
+                "This PUG has already ended or been cancelled.", ephemeral=True
+            )
+            return
+
+        existing_class = await db.get_signup_by_user_and_class(self.match_id, interaction.user.id, self.class_name)
+        if existing_class and existing_class["status"] != "denied":
+            await interaction.followup.send(
+                f"You're already signed up for **{self.class_name}**.", ephemeral=True
+            )
+            return
+
+        # Clash check
+        clashing = await db.get_accepted_matches_for_user(
+            interaction.user.id,
+            exclude_match_id=self.match_id,
+            reference_timestamp=match["timestamp"]
+        )
+        if clashing:
+            clash_names = ", ".join(
+                f"{m['team_name'] or 'a mix'} (<#{m['channel_id']}>)" for m in clashing
+            )
+            view = ClashConfirmView(self.match_id, self.class_name, clash_names)
+            warn = "⚠️ **Warning:** You are already accepted in " + clash_names + ". Are you sure you want to sign up for this PUG too?"
+            await interaction.followup.send(warn, view=view, ephemeral=True)
+            return
+
+        await _do_signup(interaction, self.match_id, self.class_name)
+
+
+class OPugSignupView(ui.View):
+    def __init__(self, match_id):
+        super().__init__(timeout=None)
+        for cls in TF2_CLASSES:
+            self.add_item(OPugClassButton(cls, match_id))
+        self.add_item(SignOutButton(match_id))
+
+
 class SignupView(ui.View):
     def __init__(self, match_id):
         super().__init__(timeout=None)
@@ -686,14 +748,17 @@ class ConcludeConfirmView(ui.View):
             accepted = await db.get_accepted_signups(self.match_id)
             seen, pings = set(), []
             for s in accepted:
-                if s["class_name"] not in seen:
-                    seen.add(s["class_name"])
+                if s["user_id"] not in seen:
+                    seen.add(s["user_id"])
                     pings.append(f"<@{s['user_id']}>")
-            team = match["team_name"] or "Mix"
-            conclude_msg = await channel.send(
-                f"{' '.join(pings)}\n"
-                f"🏁 **{team} vs Mix Team** has been concluded. Thanks for playing! 🫡"
-            )
+            ping_str = " ".join(pings)
+            if match["type"] == "opug":
+                division = match["division"] or "PUG"
+                notice_text = f"🏁 **{division} PUG** has been concluded. Thanks for playing! 🫡"
+            else:
+                team = match["team_name"] or "Mix"
+                notice_text = f"{ping_str}\n🏁 **{team} vs Mix Team** has been concluded. Thanks for playing! 🫡"
+            conclude_msg = await channel.send(notice_text)
             await db.set_conclude_msg(self.match_id, conclude_msg.id, match["channel_id"])
 
         # Mark as ended FIRST so channel is freed regardless of archive success
@@ -758,7 +823,13 @@ async def build_manage_text(match_id):
     def fmt(classes):
         return ", ".join(classes) if classes else "\u2014"
 
-    header = "**" + team + " vs Mix \u2014 signups**\n"
+    if match["type"] == "opug":
+        division = match["division"] or "PUG"
+        header = "**" + division + " PUG \u2014 signups**\n"
+    elif match["type"] == "fresh_pug":
+        header = "**Fresh PUG \u2014 signups**\n"
+    else:
+        header = "**" + team + " vs Mix \u2014 signups**\n"
     lines  = [header]
 
     accepted_players = [p for p in player_data.values() if p["accepted"]]
@@ -1011,6 +1082,262 @@ class ReviewView(ui.View):
         return self
 
 
+# ── OPUG Team Split ───────────────────────────────────────────────────────────
+
+class SwapClassButton(ui.Button):
+    def __init__(self, class_name, match_id, row):
+        super().__init__(
+            label=class_name,
+            emoji=CLASS_EMOJI[class_name],
+            style=discord.ButtonStyle.secondary,
+            custom_id="swap:" + str(match_id) + ":" + class_name,
+            row=row,
+        )
+        self.class_name = class_name
+        self.match_id   = match_id
+
+    async def callback(self, interaction):
+        split = await db.get_team_split(self.match_id)
+        if not split:
+            await interaction.response.send_message("No split data found.", ephemeral=True)
+            return
+
+        red = split["red"]
+        blu = split["blu"]
+
+        # Find this class's players in each team and swap
+        red_player = next((uid for uid in red if uid in red), None)
+        blu_player = next((uid for uid in blu if uid in blu), None)
+
+        # Get all accepted signups to find class assignments
+        signups = await db.get_signups_for_match(self.match_id)
+        accepted = [s for s in signups if s["status"] == "accepted"]
+
+        red_signups = [s for s in accepted if s["user_id"] in red and s["class_name"] == self.class_name]
+        blu_signups = [s for s in accepted if s["user_id"] in blu and s["class_name"] == self.class_name]
+
+        if not red_signups or not blu_signups:
+            await interaction.response.send_message(
+                "Can't swap — one team has no player for " + self.class_name + ".", ephemeral=True
+            )
+            return
+
+        red_uid = red_signups[0]["user_id"]
+        blu_uid = blu_signups[0]["user_id"]
+
+        # Swap
+        new_red = [blu_uid if uid == red_uid else uid for uid in red]
+        new_blu = [red_uid if uid == blu_uid else uid for uid in blu]
+
+        await db.save_team_split(self.match_id, new_red, new_blu)
+
+        # Rebuild view text
+        new_split    = {"red": new_red, "blu": new_blu}
+        red_team     = [s for s in accepted if s["user_id"] in new_red and s["class_name"] == self.class_name or
+                        (s["user_id"] in new_red and s["class_name"] != self.class_name and s["user_id"] in new_red)]
+        # Simpler: rebuild from new split
+        red_s = [s for s in accepted if s["user_id"] in new_red]
+        blu_s = [s for s in accepted if s["user_id"] in new_blu]
+
+        text = build_split_view_text(red_s, blu_s)
+        view = SplitView(self.match_id, red_s, blu_s)
+        await interaction.response.edit_message(content=text, view=view)
+
+
+class PostTeamsButton(ui.Button):
+    def __init__(self, match_id):
+        super().__init__(
+            label="Post teams",
+            style=discord.ButtonStyle.success,
+            custom_id="post_teams:" + str(match_id),
+            row=4,
+        )
+        self.match_id = match_id
+
+    async def callback(self, interaction):
+        await interaction.response.defer()
+        split    = await db.get_team_split(self.match_id)
+        signups  = await db.get_signups_for_match(self.match_id)
+        accepted = [s for s in signups if s["status"] == "accepted"]
+        match    = await db.get_match(self.match_id)
+
+        red_uids = split["red"]
+        blu_uids = split["blu"]
+
+        # Main roster slots only (first 2 per class)
+        red_team = []
+        blu_team = []
+        subs     = []
+        for cls in TF2_CLASSES:
+            cls_accepted = [s for s in accepted if s["class_name"] == cls]
+            for s in cls_accepted:
+                if s["user_id"] in red_uids:
+                    red_team.append(s)
+                elif s["user_id"] in blu_uids:
+                    blu_team.append(s)
+                else:
+                    subs.append(s)
+
+        channel = interaction.client.get_channel(match["channel_id"])
+        if channel:
+            msg_text = build_opug_teams_message(match, red_team, blu_team, subs)
+            await channel.send(msg_text)
+
+        # Delete the balancing chat message
+        try:
+            await interaction.message.delete()
+        except Exception:
+            pass
+
+        await interaction.followup.send("✅ Teams posted!", ephemeral=True)
+
+
+class SplitView(ui.View):
+    def __init__(self, match_id, red_team, blu_team):
+        super().__init__(timeout=None)
+        self.match_id = match_id
+        # Add swap buttons rows 0-1
+        for i, cls in enumerate(TF2_CLASSES):
+            row = 2 + i // 5
+            self.add_item(SwapClassButton(cls, match_id, row))
+        self.add_item(PostTeamsButton(match_id))
+
+
+# ── Fresh Pug Manage View ─────────────────────────────────────────────────────
+
+class OPugCancelAfterStartView(ui.View):
+    def __init__(self, match_id):
+        super().__init__(timeout=60)
+        self.match_id = match_id
+
+    @ui.button(label="Yes, cancel anyway", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction, button):
+        await interaction.response.defer(ephemeral=True)
+        success = await do_cancel(interaction.client, self.match_id)
+        if success:
+            await interaction.followup.send("✅ Match cancelled.", ephemeral=True)
+        else:
+            await interaction.followup.send("❌ Could not cancel.", ephemeral=True)
+
+    @ui.button(label="Never mind", style=discord.ButtonStyle.secondary)
+    async def abort(self, interaction, button):
+        await interaction.response.edit_message(content="Cancellation aborted.", view=None)
+
+
+class FreshPugManageView(ui.View):
+    def __init__(self, match_id):
+        super().__init__(timeout=300)
+        self.match_id = match_id
+
+    @ui.button(label="Conclude PUG", style=discord.ButtonStyle.success, row=0)
+    async def conclude(self, interaction, button):
+        match = await db.get_match(self.match_id)
+        if not match:
+            await interaction.response.send_message("Match not found.", ephemeral=True)
+            return
+        if time.time() < match["timestamp"]:
+            remaining = int(match["timestamp"] - time.time())
+            h, m = divmod(remaining // 60, 60)
+            await interaction.response.send_message(
+                f"❌ You can only conclude after the PUG has started. Starts in **{h}h {m}m**.",
+                ephemeral=True,
+            )
+            return
+        view = FreshPugConcludeConfirmView(self.match_id)
+        await interaction.response.send_message(
+            "Conclude this Fresh PUG? This will archive the thread and clean up.",
+            view=view, ephemeral=True,
+        )
+
+    @ui.button(label="Cancel PUG", style=discord.ButtonStyle.danger, row=0)
+    async def cancel(self, interaction, button):
+        view = FreshPugCancelConfirmView(self.match_id)
+        await interaction.response.send_message(
+            "⚠️ Cancel this Fresh PUG?",
+            view=view, ephemeral=True,
+        )
+
+
+class FreshPugConcludeConfirmView(ui.View):
+    def __init__(self, match_id):
+        super().__init__(timeout=60)
+        self.match_id = match_id
+
+    @ui.button(label="Yes, conclude", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction, button):
+        await interaction.response.defer(ephemeral=True)
+        match   = await db.get_match(self.match_id)
+        channel = interaction.client.get_channel(match["channel_id"])
+
+        if channel:
+            try:
+                async for msg in channel.history(limit=200, oldest_first=True):
+                    if msg.author.id == interaction.client.user.id:
+                        try:
+                            await msg.delete()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        ongoing_channel_id = getattr(interaction.client, "ongoing_channel", None)
+        if ongoing_channel_id and match["ongoing_msg_id"]:
+            try:
+                oc   = interaction.client.get_channel(ongoing_channel_id)
+                omsg = await oc.fetch_message(match["ongoing_msg_id"])
+                await omsg.delete()
+            except Exception:
+                pass
+
+        await db.end_match(self.match_id)
+        await do_archive(interaction.client, self.match_id, concluded=True)
+        await interaction.followup.send("✅ Fresh PUG concluded and archived.", ephemeral=True)
+
+    @ui.button(label="Never mind", style=discord.ButtonStyle.secondary)
+    async def abort(self, interaction, button):
+        await interaction.response.edit_message(content="Cancelled.", view=None)
+
+
+class FreshPugCancelConfirmView(ui.View):
+    def __init__(self, match_id):
+        super().__init__(timeout=60)
+        self.match_id = match_id
+
+    @ui.button(label="Yes, cancel", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction, button):
+        await interaction.response.defer(ephemeral=True)
+        match   = await db.get_match(self.match_id)
+        channel = interaction.client.get_channel(match["channel_id"])
+
+        if channel:
+            try:
+                async for msg in channel.history(limit=200, oldest_first=True):
+                    if msg.author.id == interaction.client.user.id:
+                        try:
+                            await msg.delete()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        ongoing_channel_id = getattr(interaction.client, "ongoing_channel", None)
+        if ongoing_channel_id and match["ongoing_msg_id"]:
+            try:
+                oc   = interaction.client.get_channel(ongoing_channel_id)
+                omsg = await oc.fetch_message(match["ongoing_msg_id"])
+                await omsg.delete()
+            except Exception:
+                pass
+
+        await db.end_match(self.match_id)
+        await do_archive(interaction.client, self.match_id, concluded=False)
+        await interaction.followup.send("✅ Fresh PUG cancelled.", ephemeral=True)
+
+    @ui.button(label="Never mind", style=discord.ButtonStyle.secondary)
+    async def abort(self, interaction, button):
+        await interaction.response.edit_message(content="Cancellation aborted.", view=None)
+
+
 class ManageView(ui.View):
     def __init__(self, match_id):
         super().__init__(timeout=300)
@@ -1052,8 +1379,73 @@ class ManageView(ui.View):
             view=view, ephemeral=True,
         )
 
+    @ui.button(label="Split teams", style=discord.ButtonStyle.primary, row=1)
+    async def split_teams(self, interaction, button):
+        match = await db.get_match(self.match_id)
+        if not match or match["type"] != "opug":
+            await interaction.response.send_message(
+                "❌ Team splitting is only available for Organised PUGs.", ephemeral=True
+            )
+            return
+
+        signups  = await db.get_signups_for_match(self.match_id)
+        accepted = [s for s in signups if s["status"] == "accepted"]
+
+        # Count filled slots (2 per class = 18 total)
+        slot_counts = {}
+        for s in accepted:
+            slot_counts[s["class_name"]] = slot_counts.get(s["class_name"], 0) + 1
+        total = sum(min(v, 2) for v in slot_counts.values())
+
+        if total < 18:
+            await interaction.response.send_message(
+                f"❌ Not all 18 slots are filled yet ({total}/18). Please wait until all players have signed up.",
+                ephemeral=True,
+            )
+            return
+
+        # Default split: first accepted per class → RED, second → BLU
+        red_uids = []
+        blu_uids = []
+        for cls in TF2_CLASSES:
+            cls_players = [s for s in accepted if s["class_name"] == cls][:2]
+            if len(cls_players) >= 1:
+                red_uids.append(cls_players[0]["user_id"])
+            if len(cls_players) >= 2:
+                blu_uids.append(cls_players[1]["user_id"])
+
+        await db.save_team_split(self.match_id, red_uids, blu_uids)
+
+        red_team = [s for s in accepted if s["user_id"] in red_uids]
+        blu_team = [s for s in accepted if s["user_id"] in blu_uids]
+
+        text = build_split_view_text(red_team, blu_team)
+        view = SplitView(self.match_id, red_team, blu_team)
+
+        # Post to balancing chat
+        bal_ch_id = interaction.client.config.get("balancing_chat_id")
+        if bal_ch_id:
+            bal_ch = interaction.client.get_channel(int(bal_ch_id))
+            if bal_ch:
+                await bal_ch.send(text, view=view)
+                await interaction.response.send_message(
+                    f"✅ Split posted to {bal_ch.mention}!", ephemeral=True
+                )
+                return
+        await interaction.response.send_message(text, view=view, ephemeral=True)
+
     @ui.button(label="Cancel match", style=discord.ButtonStyle.danger, row=1)
     async def cancel_match(self, interaction, button):
+        match = await db.get_match(self.match_id)
+        # Warn if match already started — they should conclude instead
+        if match and match["type"] == "opug" and time.time() > match["timestamp"]:
+            view = OPugCancelAfterStartView(self.match_id)
+            await interaction.response.send_message(
+                "⚠️ This PUG has already started. If the match was played, use **Conclude** instead.\n"
+                "Are you sure you want to cancel?",
+                view=view, ephemeral=True,
+            )
+            return
         view = CancelConfirmView(self.match_id)
         await interaction.response.send_message(
             "⚠️ Are you sure you want to cancel this match?\n"

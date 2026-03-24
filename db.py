@@ -500,3 +500,41 @@ async def get_accepted_signups_for_class_ordered(match_id, class_name):
             (match_id, class_name)
         ) as cur:
             return await cur.fetchall()
+
+async def get_active_fresh_pug():
+    """Returns the active fresh pug match if one exists."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM matches WHERE type='fresh_pug' AND ended=0 LIMIT 1"
+        ) as cur:
+            return await cur.fetchone()
+
+async def save_team_split(match_id, red_user_ids, blu_user_ids):
+    """Store team assignments as comma-separated user IDs."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Store in a simple key-value using the notes column won't work —
+        # add team_split column if not exists
+        try:
+            await db.execute("ALTER TABLE matches ADD COLUMN team_split TEXT")
+            await db.commit()
+        except Exception:
+            pass
+        import json
+        split_data = json.dumps({"red": red_user_ids, "blu": blu_user_ids})
+        await db.execute("UPDATE matches SET team_split=? WHERE id=?", (split_data, match_id))
+        await db.commit()
+
+async def get_team_split(match_id):
+    """Get stored team split, returns {"red": [...], "blu": [...]} or None."""
+    import json
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        try:
+            async with db.execute("SELECT team_split FROM matches WHERE id=?", (match_id,)) as cur:
+                row = await cur.fetchone()
+                if row and row["team_split"]:
+                    return json.loads(row["team_split"])
+        except Exception:
+            pass
+    return None

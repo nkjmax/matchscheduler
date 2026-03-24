@@ -7,9 +7,9 @@ from dateutil.tz import gettz
 from datetime import datetime
 
 import db
-from embeds import (build_mix_message, build_match_embed, build_ongoing_line,
+from embeds import (build_mix_message, build_match_embed, build_ongoing_line, build_fresh_pug_message, build_opug_message, FP_DIVISIONS, OPUG_DIVISIONS, OPUG_CHANNEL_KEY,
                     build_archive_message, DIVISIONS, TF2_CLASSES, CLASS_EMOJI)
-from views import SignupView
+from views import SignupView, OPugSignupView
 
 DEFAULT_TZ    = "Asia/Singapore"  # GMT+8
 DATETIME_HINT = (
@@ -90,7 +90,7 @@ async def post_to_ongoing(bot, match_id, channel_id):
         return
     match   = await db.get_match(match_id)
     signups = await db.get_signups_for_match(match_id)
-    line    = build_ongoing_line(match, channel_id=channel_id, signups=signups)
+    line    = build_ongoing_line(match, channel_id=channel_id, signups=signups if match["type"] in ("mix", "opug") else None)
     msg     = await ongoing_channel.send(line)
     await db.set_ongoing_msg_id(match_id, msg.id)
 
@@ -106,7 +106,7 @@ async def refresh_ongoing_line(bot, match_id):
     try:
         msg     = await ongoing_channel.fetch_message(match["ongoing_msg_id"])
         signups = await db.get_signups_for_match(match_id)
-        line    = build_ongoing_line(match, channel_id=match["channel_id"], signups=signups)
+        line    = build_ongoing_line(match, channel_id=match["channel_id"], signups=signups if match["type"] in ("mix", "opug") else None)
         await msg.edit(content=line)
     except Exception:
         pass
@@ -155,8 +155,8 @@ class MatchTypeSelect(ui.View):
             placeholder="Select match type…",
             options=[
                 discord.SelectOption(label="Mix", value="mix", description="One team is decided, 9 sign-ups"),
-                discord.SelectOption(label="Organised PUG", value="opug", description="Coming soon"),
-                discord.SelectOption(label="Fresh PUG", value="fpug", description="Coming soon"),
+                discord.SelectOption(label="Organised PUG", value="opug", description="Host organised PUG — you balance the teams"),
+                discord.SelectOption(label="Fresh PUG", value="fpug", description="Host a PUG once you hit 18 reacts"),
             ]
         )
         select.callback = self._on_select
@@ -164,10 +164,25 @@ class MatchTypeSelect(ui.View):
 
     async def _on_select(self, interaction):
         match_type = interaction.data["values"][0]
-        if match_type in ("opug", "fpug"):
+        if match_type == "opug":
+            view = OPugDivisionSelect(self.bot)
             await interaction.response.edit_message(
-                content="🚧 **PUGs are currently under development.** Check back later!",
-                view=None,
+                content="**Step 3 of 3:** Select the division.",
+                view=view,
+            )
+            return
+        if match_type == "fpug":
+            existing_fp = await db.get_active_fresh_pug()
+            if existing_fp:
+                await interaction.response.edit_message(
+                    content=f"❌ There's already a Fresh PUG happening at <t:{existing_fp['timestamp']}:F>. Please conclude or cancel it first.",
+                    view=None,
+                )
+                return
+            view = FreshPugDivisionSelect(self.bot)
+            await interaction.response.edit_message(
+                content="**Step 3 of 3:** Select the division.",
+                view=view,
             )
             return
         # Mix → division select
@@ -222,11 +237,7 @@ class MixModal(ui.Modal, title="Schedule a Mix"):
         style=discord.TextStyle.short,
         required=True, max_length=80,
     )
-    notes_input = ui.TextInput(
-        label="Notes (optional)",
-        style=discord.TextStyle.paragraph,
-        required=False, max_length=300,
-    )
+
 
     def __init__(self, bot, division):
         super().__init__()
@@ -252,7 +263,7 @@ class MixModal(ui.Modal, title="Schedule a Mix"):
 
         map_name    = self.map_input.value.strip() or "tbc"
         server      = self.server_input.value.strip()
-        notes       = self.notes_input.value.strip() or None
+        notes       = None
         pug_role_id = self.bot.config.get("pug_role_id")
 
         occupied     = await db.get_active_channel_ids()
@@ -577,6 +588,238 @@ class TeamRosterModal(ui.Modal, title="Host Team Roster"):
         await interaction.followup.send("✅ Host team roster updated!", ephemeral=True)
 
 
+# ── Organised PUG division select ────────────────────────────────────────────
+
+class OPugDivisionSelect(ui.View):
+    def __init__(self, bot):
+        super().__init__(timeout=60)
+        self.bot = bot
+        options  = [discord.SelectOption(label=d, value=d) for d in OPUG_DIVISIONS]
+        select   = ui.Select(placeholder="Select division…", options=options)
+        select.callback = self._on_select
+        self.add_item(select)
+
+    async def _on_select(self, interaction):
+        division     = interaction.data["values"][0]
+        channel_key  = OPUG_CHANNEL_KEY[division]
+        channel_id   = self.bot.config.get("opug_channels", {}).get(channel_key)
+
+        if not channel_id:
+            await interaction.response.edit_message(
+                content=f"❌ No channel configured for {division} pugs. Check config.json.",
+                view=None,
+            )
+            return
+
+        # Check if channel is already occupied
+        occupied = await db.get_active_channel_ids()
+        if int(channel_id) in occupied:
+            active = await db.get_match_by_channel(int(channel_id))
+            ts_str = f"<t:{active['timestamp']}:F>" if active else "unknown time"
+            await interaction.response.edit_message(
+                content=f"❌ There's already an active {division} PUG at {ts_str}. Please conclude or cancel it first.",
+                view=None,
+            )
+            return
+
+        await interaction.response.send_modal(OPugModal(self.bot, division, int(channel_id)))
+
+
+# ── Organised PUG modal ───────────────────────────────────────────────────────
+
+class OPugModal(ui.Modal, title="Schedule an Organised PUG"):
+    datetime_input = ui.TextInput(
+        label="Date & Time (GMT+8, DD/MM/YY)",
+        placeholder="e.g.  25/3/25 8:00 PM  or  5/3/25 9PM",
+        style=discord.TextStyle.short,
+        required=True,
+    )
+    map_input = ui.TextInput(
+        label="Map (leave blank for TBC)",
+        placeholder="e.g. cp_process_final",
+        style=discord.TextStyle.short,
+        required=False,
+        max_length=80,
+    )
+    server_input = ui.TextInput(
+        label="Server & Location",
+        default="Matcha Singapore",
+        style=discord.TextStyle.short,
+        required=True,
+        max_length=80,
+    )
+
+    def __init__(self, bot, division, channel_id):
+        super().__init__()
+        self.bot        = bot
+        self.division   = division
+        self.channel_id = channel_id
+
+    async def on_submit(self, interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        unix = parse_datetime(self.datetime_input.value.strip())
+        if unix is None:
+            await interaction.followup.send(
+                f"❌ Couldn't parse that date/time.\n{DATETIME_HINT}", ephemeral=True
+            )
+            return
+        if unix < time.time():
+            await interaction.followup.send(
+                "❌ That date/time is in the past.", ephemeral=True
+            )
+            return
+
+        map_name    = self.map_input.value.strip() or "tbc"
+        server      = self.server_input.value.strip()
+        pug_role_id = self.bot.config.get("pug_role_id")
+
+        channel = self.bot.get_channel(self.channel_id)
+        if not channel:
+            await interaction.followup.send(
+                "❌ Could not access the PUG channel. Check config.json.", ephemeral=True
+            )
+            return
+
+        match_id = await db.create_match(
+            type_="opug", timestamp=unix,
+            created_by=interaction.user.id,
+            created_by_name=interaction.user.display_name,
+            team_name=None, notes=None,
+            division=self.division, map_name=map_name,
+            server=server, pug_role_id=pug_role_id,
+        )
+
+        match   = await db.get_match(match_id)
+        content = build_opug_message(match, [], pug_role_id=pug_role_id)
+        view    = OPugSignupView(match_id)
+        msg     = await channel.send(content=content, view=view)
+        await db.set_message_id(match_id, msg.id, channel.id)
+
+        try:
+            thread = await msg.create_thread(
+                name=f"{self.division} PUG — signup thread",
+                auto_archive_duration=1440,
+            )
+            await db.set_thread_id(match_id, thread.id)
+        except Exception:
+            pass
+
+        await post_to_ongoing(self.bot, match_id, channel.id)
+        await interaction.followup.send(
+            f"✅ {self.division} PUG posted to {channel.mention}!", ephemeral=True
+        )
+
+
+# ── Fresh Pug division select ─────────────────────────────────────────────────
+
+class FreshPugDivisionSelect(ui.View):
+    def __init__(self, bot):
+        super().__init__(timeout=60)
+        self.bot = bot
+        options  = [discord.SelectOption(label=d, value=d) for d in FP_DIVISIONS]
+        select   = ui.Select(placeholder="Select division…", options=options)
+        select.callback = self._on_select
+        self.add_item(select)
+
+    async def _on_select(self, interaction):
+        division = interaction.data["values"][0]
+        await interaction.response.send_modal(FreshPugModal(self.bot, division))
+
+
+# ── Fresh Pug modal ───────────────────────────────────────────────────────────
+
+class FreshPugModal(ui.Modal, title="Schedule a Fresh PUG"):
+    datetime_input = ui.TextInput(
+        label="Date & Time (GMT+8, DD/MM/YY)",
+        placeholder="e.g.  25/3/25 8:00 PM  or  5/3/25 9PM",
+        style=discord.TextStyle.short,
+        required=True,
+    )
+    map_input = ui.TextInput(
+        label="Maps (leave blank for TBC)",
+        placeholder="e.g. cp_process_final, koth_product_rc9",
+        style=discord.TextStyle.short,
+        required=False,
+        max_length=120,
+    )
+
+    def __init__(self, bot, division):
+        super().__init__()
+        self.bot      = bot
+        self.division = division
+
+    async def on_submit(self, interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        unix = parse_datetime(self.datetime_input.value.strip())
+        if unix is None:
+            await interaction.followup.send(
+                f"❌ Couldn't parse that date/time.\n{DATETIME_HINT}", ephemeral=True
+            )
+            return
+        if unix < time.time():
+            await interaction.followup.send(
+                "❌ That date/time is in the past.", ephemeral=True
+            )
+            return
+
+        map_name    = self.map_input.value.strip() or "tbc"
+        pug_role_id = self.bot.config.get("pug_role_id")
+
+        fp_channel_id = self.bot.config.get("fresh_pug_channel_id")
+        if not fp_channel_id:
+            await interaction.followup.send(
+                "❌ No fresh_pug_channel_id set in config.", ephemeral=True
+            )
+            return
+
+        channel = self.bot.get_channel(int(fp_channel_id))
+        if not channel:
+            await interaction.followup.send(
+                "❌ Could not access the fresh pug channel. Check config.json.", ephemeral=True
+            )
+            return
+
+        # Block if there's already an active fresh pug
+        existing_fp = await db.get_active_fresh_pug()
+        if existing_fp:
+            await interaction.followup.send(
+                f"❌ There's already a Fresh PUG happening at <t:{existing_fp['timestamp']}:F>. "
+                "Please conclude or cancel it first.",
+                ephemeral=True,
+            )
+            return
+
+        match_id = await db.create_match(
+            type_="fresh_pug", timestamp=unix,
+            created_by=interaction.user.id,
+            created_by_name=interaction.user.display_name,
+            team_name=None, notes=None,
+            division=self.division, map_name=map_name,
+            server=None, pug_role_id=pug_role_id,
+        )
+
+        match   = await db.get_match(match_id)
+        content = build_fresh_pug_message(match, pug_role_id=pug_role_id)
+        msg     = await channel.send(content)
+        await db.set_message_id(match_id, msg.id, channel.id)
+
+        try:
+            thread = await msg.create_thread(
+                name="FRESH PUG",
+                auto_archive_duration=1440,
+            )
+            await db.set_thread_id(match_id, thread.id)
+        except Exception:
+            pass
+
+        await post_to_ongoing(self.bot, match_id, channel.id)
+        await interaction.followup.send(
+            f"✅ Fresh PUG posted to {channel.mention}!", ephemeral=True
+        )
+
+
 # ── Connect string modal ──────────────────────────────────────────────────────
 
 class ConnectModal(ui.Modal, title="Post Connect String"):
@@ -719,11 +962,19 @@ class ScheduleCog(commands.Cog):
             )
             return
 
+        from embeds import TF2_CLASSES, CLASS_EMOJI, OPUG_CHANNEL_KEY
+
+        # Determine role pings based on match type and division
         pug_role_id = self.bot.config.get("pug_role_id")
-        pug_ping    = f"<@&{pug_role_id}>" if pug_role_id else "@here"
+        if match["type"] == "opug":
+            division    = match["division"] or ""
+            channel_key = OPUG_CHANNEL_KEY.get(division)
+            role_ids    = self.bot.config.get("opug_roles", {}).get(channel_key, [])
+            pug_ping    = " ".join(f"<@&{rid}>" for rid in role_ids) if role_ids else (f"<@&{pug_role_id}>" if pug_role_id else "@here")
+        else:
+            pug_ping = f"<@&{pug_role_id}>" if pug_role_id else "@here"
 
         # Find unfilled main roster slots
-        from embeds import TF2_CLASSES, CLASS_EMOJI
         signups  = await db.get_signups_for_match(match["id"])
         accepted = {}
         for s in signups:
@@ -733,7 +984,21 @@ class ScheduleCog(commands.Cog):
         unfilled = [cls for cls in TF2_CLASSES if cls not in accepted]
         filled   = len(TF2_CLASSES) - len(unfilled)
 
-        if filled >= 5:
+        if match["type"] == "opug":
+            # For opugs count by slots (2 per class = 18)
+            slot_counts = {}
+            for s in signups:
+                if s["status"] == "accepted":
+                    slot_counts[s["class_name"]] = slot_counts.get(s["class_name"], 0) + 1
+            total_filled = sum(min(v, 2) for v in slot_counts.values())
+            missing_cls  = [cls for cls in TF2_CLASSES if slot_counts.get(cls, 0) < 2]
+            if total_filled >= 14:
+                class_emojis = ", ".join(CLASS_EMOJI[cls] for cls in dict.fromkeys(missing_cls))
+                msg = f"{pug_ping} Just {class_emojis} left"
+            else:
+                division = match["division"] or "PUG"
+                msg = f"{pug_ping} Need players for {division} PUG"
+        elif filled >= 5:
             class_emojis = ", ".join(CLASS_EMOJI[cls] for cls in unfilled)
             msg = f"{pug_ping} Just {class_emojis} left"
         else:
@@ -744,6 +1009,7 @@ class ScheduleCog(commands.Cog):
         channel = self.bot.get_channel(match["channel_id"])
         if channel:
             await channel.send(msg)
+
 
 
 async def setup(bot):

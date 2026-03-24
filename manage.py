@@ -41,10 +41,18 @@ class ManageCog(commands.Cog):
 
         match_id = match["id"]
 
-        from views import build_manage_text
-        text, _ = await build_manage_text(match_id)
-        view = await ManageView.create(match_id)
-        await interaction.response.send_message(text, view=view, ephemeral=True)
+        from views import build_manage_text, FreshPugManageView
+        if match["type"] == "fresh_pug":
+            view = FreshPugManageView(match_id)
+            await interaction.response.send_message(
+                f"**Fresh PUG** — {match['division']} | <t:{match['timestamp']}:F>",
+                view=view, ephemeral=True
+            )
+        else:
+            # mix and opug both use the full manage panel
+            text, _ = await build_manage_text(match_id)
+            view = await ManageView.create(match_id)
+            await interaction.response.send_message(text, view=view, ephemeral=True)
 
 
 
