@@ -3,7 +3,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import db
-from views import ManageView, SignupView
+from views import ManageView, SignupView, OPugSignupView, SixsSignupView, FreshPugManageView
 
 
 def is_hoster(interaction):
@@ -20,7 +20,13 @@ class ManageCog(commands.Cog):
     async def cog_load(self):
         matches = await db.get_all_active_matches()
         for match in matches:
-            view = SignupView(match["id"])
+            match_type = match["type"]
+            if match_type in ("6s_mix", "6s_opug"):
+                view = SixsSignupView(match["id"])
+            elif match_type == "opug":
+                view = OPugSignupView(match["id"])
+            else:
+                view = SignupView(match["id"])
             self.bot.add_view(view)
 
     @app_commands.command(name="manage", description="Open the manage panel for the match in this channel.")
@@ -42,14 +48,14 @@ class ManageCog(commands.Cog):
         match_id = match["id"]
 
         from views import build_manage_text, FreshPugManageView
-        if match["type"] == "fresh_pug":
+        if match["type"] in ("fresh_pug", "6s_fresh_pug"):
+            mode = "Fresh PUG 6v6" if match["type"] == "6s_fresh_pug" else "Fresh PUG"
             view = FreshPugManageView(match_id)
             await interaction.response.send_message(
-                f"**Fresh PUG** — {match['division']} | <t:{match['timestamp']}:F>",
+                f"**{mode}** — {match['division']} | <t:{match['timestamp']}:F>",
                 view=view, ephemeral=True
             )
         else:
-            # mix and opug both use the full manage panel
             text, _ = await build_manage_text(match_id)
             view = await ManageView.create(match_id)
             await interaction.response.send_message(text, view=view, ephemeral=True)

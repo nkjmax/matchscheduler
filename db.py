@@ -65,6 +65,10 @@ async def init_db():
             ("conclude_msg_id",  "INTEGER"),
             ("conclude_delete_at", "INTEGER"),
             ("host_roster",        "TEXT"),
+            ("teams_posted",       "INTEGER DEFAULT 0"),
+            ("pending_msg_id",     "INTEGER"),
+            ("denied_msg_id",      "INTEGER"),
+            ("ping_msg_id",        "INTEGER"),
         ]:
             try:
                 await db.execute(f"ALTER TABLE matches ADD COLUMN {col} {definition}")
@@ -133,6 +137,39 @@ async def set_ongoing_msg_id(match_id, ongoing_msg_id):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE matches SET ongoing_msg_id=? WHERE id=?", (ongoing_msg_id, match_id)
+        )
+        await db.commit()
+
+async def set_teams_posted(match_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE matches SET teams_posted=1 WHERE id=?", (match_id,))
+        await db.commit()
+
+async def set_pending_msg_id(match_id, msg_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE matches SET pending_msg_id=? WHERE id=?", (msg_id, match_id))
+        await db.commit()
+
+async def set_denied_msg_id(match_id, msg_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE matches SET denied_msg_id=? WHERE id=?", (msg_id, match_id))
+        await db.commit()
+
+async def set_ping_msg_id(match_id, msg_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE matches SET ping_msg_id=? WHERE id=?", (msg_id, match_id))
+        await db.commit()
+
+async def remove_pending_slots_for_user(match_id, user_id, keep_class):
+    """
+    When a player is accepted on the main roster for keep_class,
+    delete all their pending signups on other classes in this match.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """DELETE FROM signups
+               WHERE match_id=? AND user_id=? AND class_name!=? AND status='pending'""",
+            (match_id, user_id, keep_class)
         )
         await db.commit()
 
@@ -436,6 +473,26 @@ async def get_signup_by_user_and_class(match_id, user_id, class_name):
         ) as cur:
             return await cur.fetchone()
 
+async def swap_signup_order(main_signup, sub_signup):
+    """
+    Swap two signups in the roster order by deleting both and re-inserting
+    sub first (gets lower auto-increment id = higher priority), main second.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM signups WHERE id IN (?, ?)", (main_signup["id"], sub_signup["id"]))
+        await db.execute(
+            "INSERT INTO signups (match_id, user_id, username, class_name, team, status) VALUES (?,?,?,?,?,?)",
+            (sub_signup["match_id"], sub_signup["user_id"], sub_signup["username"],
+             sub_signup["class_name"], sub_signup["team"], sub_signup["status"])
+        )
+        await db.execute(
+            "INSERT INTO signups (match_id, user_id, username, class_name, team, status) VALUES (?,?,?,?,?,?)",
+            (main_signup["match_id"], main_signup["user_id"], main_signup["username"],
+             main_signup["class_name"], main_signup["team"], main_signup["status"])
+        )
+        await db.commit()
+
+
 async def count_unique_signedup_players(match_id):
     """Count distinct players with any non-denied signup in this match."""
     async with aiosqlite.connect(DB_PATH) as db:
@@ -538,3 +595,12 @@ async def get_team_split(match_id):
         except Exception:
             pass
     return None
+
+async def get_active_6s_fresh_pug():
+    """Returns the active 6s fresh pug match if one exists."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM matches WHERE type='6s_fresh_pug' AND ended=0 LIMIT 1"
+        ) as cur:
+            return await cur.fetchone()

@@ -4,13 +4,13 @@ import discord
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import db
-from embeds import build_match_embed, build_mix_message
+from embeds import build_ongoing_line
 
 log = logging.getLogger("scheduler")
 
 
 def start_scheduler(bot):
-    from views import SignupView, ManageView
+    from views import ManageView
 
     scheduler = AsyncIOScheduler()
 
@@ -37,6 +37,8 @@ def start_scheduler(bot):
                     await msg.delete()
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 pass
+            except Exception as e:
+                log.warning(f"clean_conclude_notices failed for match #{match['id']}: {e}")
             await db.clear_conclude_msg(match["id"])
 
     # ── 1-hour reminder: ping roster in the match channel ────────────────────
@@ -59,10 +61,16 @@ def start_scheduler(bot):
             channel = bot.get_channel(match["channel_id"])
             if channel:
                 try:
-                    team = match["team_name"] or "Mix"
+                    match_type = match["type"]
+                    if match_type in ("opug", "6s_opug"):
+                        match_label = f"{match['division'] or 'PUG'} PUG"
+                    elif match_type == "6s_mix":
+                        match_label = f"{match['team_name'] or 'Mix'} vs Mix 6s"
+                    else:
+                        match_label = f"{match['team_name'] or 'Mix'} vs Mix"
                     await channel.send(
                         f"⏰ **1 hour reminder!** {' '.join(pings)}\n"
-                        f"**{team} vs Mix Team** starts <t:{match['timestamp']}:R>. Get ready!"
+                        f"**{match_label}** starts <t:{match['timestamp']}:R>. Get ready!"
                     )
                 except Exception as e:
                     log.warning(f"Could not send 1h reminder for match #{match['id']}: {e}")
@@ -77,11 +85,17 @@ def start_scheduler(bot):
             if hoster_channel_id:
                 hoster_ch = bot.get_channel(int(hoster_channel_id))
                 if hoster_ch:
-                    team = match["team_name"] or "Mix"
+                    match_type = match["type"]
+                    if match_type in ("opug", "6s_opug"):
+                        match_label = f"{match['division'] or 'PUG'} PUG"
+                    elif match_type == "6s_mix":
+                        match_label = f"{match['team_name'] or 'Mix'} vs Mix 6s"
+                    else:
+                        match_label = f"{match['team_name'] or 'Mix'} vs Mix"
                     view = ManageView(match["id"])
                     await hoster_ch.send(
                         f"<@{match['created_by']}> ⏰ It's been 8 hours since "
-                        f"<#{match['channel_id']}> ({team} vs Mix) started. "
+                        f"<#{match['channel_id']}> ({match_label}) started. "
                         f"If the match is over, please conclude it.",
                         view=view,
                     )
@@ -91,30 +105,27 @@ def start_scheduler(bot):
     async def re_sort():
         if not bot.config.get("re_sort_enabled", False):
             return
-        channel = bot.get_channel(bot.ongoing_channel)
-        if not channel:
+        ongoing_channel = bot.get_channel(bot.ongoing_channel)
+        if not ongoing_channel:
             return
         matches = await db.get_all_active_matches()
         for match in matches:
-            signups = await db.get_signups_for_match(match["id"])
-            view    = SignupView(match["id"])
-            if match["type"] == "mix":
-                pug_role_id = bot.config.get("pug_role_id")
-                content = build_mix_message(match, signups, pug_role_id=pug_role_id)
-            else:
-                content = None
-            if match["message_id"]:
+            # Delete the existing ongoing-matches line for this match
+            if match["ongoing_msg_id"]:
                 try:
-                    old = await channel.fetch_message(match["message_id"])
+                    old = await ongoing_channel.fetch_message(match["ongoing_msg_id"])
                     await old.delete()
                 except (discord.NotFound, discord.HTTPException):
                     pass
-            if content:
-                new_msg = await channel.send(content=content, view=view)
-            else:
-                embed   = build_match_embed(match, signups)
-                new_msg = await channel.send(embed=embed, view=view)
-            await db.set_message_id(match["id"], new_msg.id, channel.id)
+            # Repost as a fresh ongoing line (plain text, no view)
+            signups = await db.get_signups_for_match(match["id"])
+            line    = build_ongoing_line(
+                match,
+                channel_id=match["channel_id"],
+                signups=signups if match["type"] in ("mix", "opug", "6s_mix", "6s_opug") else None,
+            )
+            new_msg = await ongoing_channel.send(line)
+            await db.set_ongoing_msg_id(match["id"], new_msg.id)
 
     scheduler.add_job(clean_cancel_notices,  "interval", minutes=5,  id="clean_cancel_notices")
     scheduler.add_job(clean_conclude_notices, "interval", minutes=5,  id="clean_conclude_notices")

@@ -80,12 +80,14 @@ async def main():
                     if edit_class:
                         # Single class edit — update just that slot in the stored roster
                         match = await _db.get_match(pending_r["match_id"])
-                        from embeds import TF2_CLASSES
+                        from embeds import TF2_CLASSES, SIXS_CLASSES
+                        is_sixs    = match["type"] in ("6s_mix", "6s_opug")
+                        class_list = SIXS_CLASSES if is_sixs else TF2_CLASSES
                         existing = match["host_roster"] or ""
                         entries  = existing.split("\n") if existing else []
-                        while len(entries) < 9:
+                        while len(entries) < len(class_list):
                             entries.append("")
-                        idx = TF2_CLASSES.index(edit_class)
+                        idx = class_list.index(edit_class)
                         entries[idx] = message.content.strip()
                         await _db.update_match_fields(pending_r["match_id"], host_roster="\n".join(entries))
                     else:
@@ -102,11 +104,19 @@ async def main():
 
                     if channel:
                         if edit_class and match["message_id"]:
-                            # Just edit the existing message
-                            from embeds import build_mix_message
+                            # Just edit the existing message with the correct builder
+                            from embeds import build_mix_message, build_6s_mix_message, build_opug_message, build_6s_opug_message
                             try:
                                 msg = await channel.fetch_message(match["message_id"])
-                                await msg.edit(content=build_mix_message(match, signups, pug_role_id=pug_role_id))
+                                if match["type"] == "6s_mix":
+                                    content = build_6s_mix_message(match, signups, pug_role_id=pug_role_id)
+                                elif match["type"] == "6s_opug":
+                                    content = build_6s_opug_message(match, signups, pug_role_id=pug_role_id)
+                                elif match["type"] == "opug":
+                                    content = build_opug_message(match, signups, pug_role_id=pug_role_id)
+                                else:
+                                    content = build_mix_message(match, signups, pug_role_id=pug_role_id)
+                                await msg.edit(content=content)
                             except Exception:
                                 pass
                         else:
@@ -120,16 +130,30 @@ async def main():
                                     pass
                                 await _db.clear_conclude_msg(prev["id"])
 
-                            content_msg = build_mix_message(match, signups, pug_role_id=pug_role_id)
-                            view        = SignupView(match["id"])
-                            msg         = await channel.send(content=content_msg, view=view)
+                            if match["type"] == "6s_mix":
+                                from embeds import build_6s_mix_message
+                                from views import SixsSignupView
+                                content_msg = build_6s_mix_message(match, signups, pug_role_id=pug_role_id)
+                                view        = SixsSignupView(match["id"])
+                                thread_name = f"{match['team_name']} vs Mix 6s — {match['division']}"
+                            else:
+                                content_msg = build_mix_message(match, signups, pug_role_id=pug_role_id)
+                                view        = SignupView(match["id"])
+                                thread_name = f"{match['team_name']} vs Mix — {match['division']}"
+
+                            msg = await channel.send(content=content_msg, view=view)
                             await _db.set_message_id(match["id"], msg.id, channel.id)
 
+                            # Post pending and denied tracking messages for mix types
+                            if match["type"] in ("mix", "6s_mix"):
+                                from embeds import build_pending_message, build_denied_message
+                                pending_msg = await channel.send(content=build_pending_message(match, signups))
+                                denied_msg  = await channel.send(content=build_denied_message(match, signups))
+                                await _db.set_pending_msg_id(match["id"], pending_msg.id)
+                                await _db.set_denied_msg_id(match["id"], denied_msg.id)
+
                             try:
-                                thread = await msg.create_thread(
-                                    name=f"{match['team_name']} vs Mix — {match['division']}",
-                                    auto_archive_duration=1440,
-                                )
+                                thread = await msg.create_thread(name=thread_name, auto_archive_duration=1440)
                                 await _db.set_thread_id(match["id"], thread.id)
                             except Exception:
                                 pass
@@ -146,49 +170,35 @@ async def main():
 
                 connect = None
                 sdr     = None
-                tv      = None
 
-                def parse_embeds(embeds):
-                    nonlocal connect, sdr, tv
-                    for embed in embeds:
-                        texts = []
-                        if embed.description:
-                            texts.append(embed.description)
-                        for field in embed.fields:
-                            if field.value:
-                                texts.append(field.value)
-                        for text in texts:
-                            blocks = _re.findall(r"`{1,3}([^`]+)`{1,3}", text)
-                            for block in blocks:
-                                block = block.strip()
-                                if _re.match(r"connect 169\.254\.", block, _re.I):
-                                    sdr = block
-                                elif _re.match(r"connect [\d.]+:270\d\d", block, _re.I):
-                                    tv = block
-                                elif _re.match(r"connect ", block, _re.I):
-                                    connect = block
-
-                def parse_text(text):
-                    nonlocal connect, sdr, tv
-                    # Try backtick code blocks first
-                    blocks = _re.findall(r"`{1,3}([^`]+)`{1,3}", text)
-                    # Also try raw lines starting with "connect"
-                    raw_lines = [l.strip() for l in text.splitlines() if l.strip().lower().startswith("connect")]
-                    all_candidates = [b.strip() for b in blocks] + raw_lines
-                    for block in all_candidates:
-                        block = block.strip()
-                        if not block:
-                            continue
-                        if _re.match(r"connect 169\.254\.", block, _re.I):
-                            sdr = sdr or block
-                        elif _re.match(r"connect [\d.]+:270\d\d", block, _re.I):
-                            tv = tv or block
-                        elif _re.match(r"connect ", block, _re.I):
-                            connect = connect or block
-
-                # Parse plain pasted text (forwarding doesn't work — must paste)
                 if message.content:
-                    parse_text(message.content)
+                    text = message.content
+
+                    def extract_section(t, header):
+                        pat = _re.compile(
+                            _re.escape(header) + r'[^\n]*\n+(?:`+\n?)?(connect[^\n`]+)',
+                            _re.IGNORECASE
+                        )
+                        m = pat.search(t)
+                        return m.group(1).strip() if m else None
+
+                    sdr     = extract_section(text, "SDR Connect String")
+                    connect = extract_section(text, "Connect String")
+                    if connect and sdr and connect == sdr:
+                        connect = None
+
+                    # Fallback
+                    if not connect or not sdr:
+                        for line in text.splitlines():
+                            line = line.strip().strip("`").strip()
+                            if not line.lower().startswith("connect"):
+                                continue
+                            if _re.match(r"connect 169\.254\.", line, _re.I):
+                                sdr = sdr or line
+                            elif _re.search(r":2702\d\b", line):
+                                pass  # SourceTV, skip
+                            else:
+                                connect = connect or line
 
                 if not connect and not sdr:
                     await message.channel.send(
@@ -214,9 +224,6 @@ async def main():
                 if sdr:
                     out_lines.append("**SDR Connect String**")
                     out_lines.append(f"```{sdr}```")
-                if tv:
-                    out_lines.append("**SourceTV**")
-                    out_lines.append(f"```{tv}```")
 
                 ch = bot.get_channel(pending["channel_id"])
                 if ch:

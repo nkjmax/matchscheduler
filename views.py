@@ -1,8 +1,13 @@
 import time
+import logging
 import discord
 from discord import ui
 
-from embeds import TF2_CLASSES, CLASS_EMOJI, build_mix_message, build_match_embed, build_archive_message, build_opug_teams_message, build_split_view_text
+log = logging.getLogger("views")
+
+from embeds import (TF2_CLASSES, CLASS_EMOJI, build_mix_message, build_match_embed, build_archive_message,
+    build_opug_teams_message, build_split_view_text, build_pending_message, build_denied_message,
+    SIXS_CLASSES, SIXS_CLASS_EMOJI, build_6s_opug_teams_message, build_6s_split_view_text)
 import db
 
 LOW_PRIORITY_ROLE_ID = None  # set to your role ID integer if desired
@@ -31,52 +36,19 @@ async def reorder_class_roster(client, match_id, class_name):
     """
     accepted = await db.get_accepted_signups_for_class(match_id, class_name)
     if len(accepted) < 2:
-        return  # Only one player, nothing to reorder
+        return
 
-    # Check LP status for each
     lp_status = {}
     for s in accepted:
         lp_status[s["id"]] = await is_lp(client, s["user_id"])
 
-    main_roster = accepted[0]  # First accepted = main roster
+    main_roster = accepted[0]
     subs        = accepted[1:]
 
-    # If main roster is LP, find first non-LP sub to swap with
     if lp_status[main_roster["id"]]:
         non_lp_sub = next((s for s in subs if not lp_status[s["id"]]), None)
         if non_lp_sub:
-            # Swap: demote main to sub order (move to after last LP sub),
-            # promote non_lp_sub to main by swapping their signup IDs
-            # We do this by updating the id ordering — easiest is to
-            # re-insert: delete main, re-insert at end, so non_lp_sub becomes first
-            async with __import__('aiosqlite').connect(__import__('db').DB_PATH) as adb:
-                # Get the main roster signup details
-                await adb.execute(
-                    "UPDATE signups SET id = id WHERE id = ?",
-                    (main_roster["id"],)
-                )
-                # Swap IDs by updating timestamps — use a temp value
-                # Actually simplest: change the signup order by re-inserting
-                # Get full rows
-                main_data = dict(main_roster)
-                sub_data  = dict(non_lp_sub)
-
-                # Delete both
-                await adb.execute("DELETE FROM signups WHERE id IN (?, ?)",
-                    (main_data["id"], sub_data["id"]))
-
-                # Re-insert non-LP first (gets lower auto-increment), LP second
-                await adb.execute(
-                    "INSERT INTO signups (match_id, user_id, username, class_name, team, status) VALUES (?,?,?,?,?,?)",
-                    (sub_data["match_id"], sub_data["user_id"], sub_data["username"],
-                     sub_data["class_name"], sub_data["team"], sub_data["status"])
-                )
-                await adb.execute(
-                    "INSERT INTO signups (match_id, user_id, username, class_name, team, status) VALUES (?,?,?,?,?,?)",
-                    (main_data["match_id"], main_data["user_id"], main_data["username"],
-                     main_data["class_name"], main_data["team"], main_data["status"])
-                )
-                await adb.commit()
+            await db.swap_signup_order(dict(main_roster), dict(non_lp_sub))
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -91,17 +63,48 @@ async def refresh_message(client, match_id):
         if not channel:
             return
         msg = await channel.fetch_message(match["message_id"])
+        pug_role_id = getattr(client, "config", {}).get("pug_role_id")
         if match["type"] == "mix":
-            pug_role_id = getattr(client, "config", {}).get("pug_role_id")
             await msg.edit(content=build_mix_message(match, signups, pug_role_id=pug_role_id), embed=None)
         elif match["type"] == "opug":
             from embeds import build_opug_message
-            pug_role_id = getattr(client, "config", {}).get("pug_role_id")
             await msg.edit(content=build_opug_message(match, signups, pug_role_id=pug_role_id), embed=None)
+        elif match["type"] == "6s_mix":
+            from embeds import build_6s_mix_message
+            await msg.edit(content=build_6s_mix_message(match, signups, pug_role_id=pug_role_id), embed=None)
+        elif match["type"] == "6s_opug":
+            from embeds import build_6s_opug_message
+            await msg.edit(content=build_6s_opug_message(match, signups, pug_role_id=pug_role_id), embed=None)
         else:
             await msg.edit(embed=build_match_embed(match, signups))
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning(f"refresh_message (main) failed for match #{match_id}: {e}")
+
+    # Refresh pending and denied messages for mix and opug types
+    if match["type"] in ("mix", "6s_mix", "opug", "6s_opug"):
+        channel = client.get_channel(match["channel_id"])
+        if channel:
+            try:
+                pending_msg_id = match["pending_msg_id"]
+            except (IndexError, KeyError):
+                pending_msg_id = None
+            try:
+                denied_msg_id = match["denied_msg_id"]
+            except (IndexError, KeyError):
+                denied_msg_id = None
+
+            if pending_msg_id:
+                try:
+                    pmsg = await channel.fetch_message(pending_msg_id)
+                    await pmsg.edit(content=build_pending_message(match, signups))
+                except Exception as e:
+                    log.warning(f"refresh_message (pending) failed for match #{match_id}: {e}")
+            if denied_msg_id:
+                try:
+                    dmsg = await channel.fetch_message(denied_msg_id)
+                    await dmsg.edit(content=build_denied_message(match, signups))
+                except Exception as e:
+                    log.warning(f"refresh_message (denied) failed for match #{match_id}: {e}")
 
     # Also refresh the ongoing-matches line
     try:
@@ -260,12 +263,21 @@ async def do_cancel(client, match_id):
     # Archive (best effort — errors won't block the cancel)
     await do_archive(client, match_id, concluded=False)
 
+    match_type = match["type"]
+    if match_type in ("mix", "6s_mix"):
+        mode_label = f"**{match['team_name'] or 'Mix'} vs Mix{' 6s' if match_type == '6s_mix' else ''}**"
+    elif match_type in ("opug", "6s_opug"):
+        mode_label = f"**{match['division'] or 'PUG'} PUG{' (6s)' if match_type == '6s_opug' else ''}**"
+    elif match_type in ("fresh_pug", "6s_fresh_pug"):
+        mode_label = f"**Fresh PUG{' 6s' if match_type == '6s_fresh_pug' else ''}**"
+    else:
+        mode_label = "**Match**"
+
     cancel_embed = discord.Embed(
         title="❌ Match Cancelled",
         description=(
-            f"**{'Mix' if match['type'] == 'mix' else 'PUG'}**"
-            + (f" vs {match['team_name']}" if match["team_name"] else "")
-            + f"\nHosted by {match['created_by_name']} has been **cancelled**."
+            f"{mode_label}\n"
+            f"Hosted by {match['created_by_name']} has been **cancelled**."
         ),
         colour=discord.Colour.red(),
     )
@@ -292,9 +304,34 @@ class SignOutConfirmView(ui.View):
 
     @ui.button(label="Yes, sign out anyway", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction, button):
+        await interaction.response.defer(ephemeral=True)
         await do_signout(interaction.client, self.match_id, self.user_id, self.class_name)
-        await interaction.response.edit_message(
+        await interaction.edit_original_response(
             content="You have been signed out. Please find a replacement as soon as possible.",
+            view=None,
+        )
+
+    @ui.button(label="Stay signed up", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction, button):
+        await interaction.response.edit_message(
+            content="Sign-out cancelled. You're still signed up.", view=None
+        )
+
+
+class SignOutAllConfirmView(ui.View):
+    def __init__(self, match_id, user_id):
+        super().__init__(timeout=60)
+        self.match_id = match_id
+        self.user_id  = user_id
+
+    @ui.button(label="Yes, sign out of everything", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction, button):
+        await interaction.response.defer(ephemeral=True)
+        signups = await db.get_non_denied_signups_for_user(self.match_id, self.user_id)
+        for s in signups:
+            await do_signout(interaction.client, self.match_id, self.user_id, s["class_name"])
+        await interaction.edit_original_response(
+            content="You have been signed out of all classes. Please find replacements as soon as possible.",
             view=None,
         )
 
@@ -307,27 +344,57 @@ class SignOutConfirmView(ui.View):
 
 class SignOutClassPickerView(ui.View):
     """Shown when a user is signed up on multiple classes and wants to sign out."""
-    def __init__(self, match_id, user_id, signups, within_hour):
+    def __init__(self, match_id, user_id, signups, within_hour, rostered_classes):
         super().__init__(timeout=60)
-        self.match_id    = match_id
-        self.user_id     = user_id
-        self.within_hour = within_hour
+        self.match_id        = match_id
+        self.user_id         = user_id
+        self.within_hour     = within_hour
+        self.rostered_classes = rostered_classes  # set of class names where user is on main roster
+        all_emojis = {**CLASS_EMOJI, **SIXS_CLASS_EMOJI}
         options = [
             discord.SelectOption(
                 label=s["class_name"],
                 value=s["class_name"],
-                emoji=CLASS_EMOJI.get(s["class_name"]),
+                emoji=all_emojis.get(s["class_name"]),
                 description=f"Status: {s['status']}"
             )
             for s in signups
         ]
+        options.append(discord.SelectOption(
+            label="All classes",
+            value="_all",
+            emoji="🚪",
+            description="Sign out of everything"
+        ))
         select = ui.Select(placeholder="Select class to sign out of…", options=options)
         select.callback = self._on_select
         self.add_item(select)
 
     async def _on_select(self, interaction):
-        class_name = interaction.data["values"][0]
-        if self.within_hour:
+        value = interaction.data["values"][0]
+
+        if value == "_all":
+            # Within-hour warning only if rostered on at least one class
+            if self.within_hour and self.rostered_classes:
+                lp_warning = ""
+                if LOW_PRIORITY_ROLE_ID:
+                    lp_warning = f"\n⚠️ You will receive the <@&{LOW_PRIORITY_ROLE_ID}> role if you fail to find replacements."
+                view = SignOutAllConfirmView(self.match_id, self.user_id)
+                await interaction.response.edit_message(
+                    content=f"⚠️ **Warning:** The match starts in less than 1 hour.{lp_warning}\nSign out of **all classes**?",
+                    view=view,
+                )
+            else:
+                await interaction.response.defer(ephemeral=True)
+                signups = await db.get_non_denied_signups_for_user(self.match_id, self.user_id)
+                for s in signups:
+                    await do_signout(interaction.client, self.match_id, self.user_id, s["class_name"])
+                await interaction.followup.send("You have been signed out of all classes.", ephemeral=True)
+            return
+
+        class_name = value
+        # Within-hour warning only if rostered on this class
+        if self.within_hour and class_name in self.rostered_classes:
             lp_warning = ""
             if LOW_PRIORITY_ROLE_ID:
                 lp_warning = f"\n⚠️ You will receive the <@&{LOW_PRIORITY_ROLE_ID}> role if you fail to find a replacement."
@@ -337,10 +404,9 @@ class SignOutClassPickerView(ui.View):
                 view=view,
             )
         else:
+            await interaction.response.defer(ephemeral=True)
             await do_signout(interaction.client, self.match_id, self.user_id, class_name)
-            await interaction.response.edit_message(
-                content=f"You have been signed out of **{class_name}**.", view=None
-            )
+            await interaction.followup.send(f"You have been signed out of **{class_name}**.", ephemeral=True)
 
 
 async def do_signout(client, match_id, user_id, class_name=None):
@@ -362,26 +428,36 @@ async def do_signout(client, match_id, user_id, class_name=None):
     match        = await db.get_match(match_id)
     channel      = client.get_channel(match["channel_id"]) if match else None
     channel_name = channel.name if channel else "the match channel"
-    team_name    = match["team_name"] or "Mix"
+    match_type   = match["type"] if match else "mix"
+
+    if match_type in ("opug", "6s_opug"):
+        match_label = f"{match['division'] or 'PUG'} PUG"
+    elif match_type == "6s_mix":
+        match_label = f"{match['team_name'] or 'Mix'} vs Mix 6s"
+    else:
+        match_label = f"{match['team_name'] or 'Mix'} vs Mix"
 
     if is_rostered:
         next_sub = await db.get_next_accepted_for_class(match_id, class_name, user_id)
 
-        # 6. Sub promotion — remove their other sub slots, ping in thread
+        # Sub promotion — remove their other sub slots, ping in thread
         if next_sub:
             await db.remove_sub_slots_for_user(match_id, next_sub["user_id"], class_name)
             if match["thread_id"]:
                 try:
                     thread = client.get_channel(match["thread_id"])
                     if thread:
+                        if match_type in ("opug", "6s_opug"):
+                            slot_context = f"**{class_name}** slot — the previous player signed out."
+                        else:
+                            slot_context = f"**{class_name}** slot on the Mix Team — the previous player signed out."
                         await thread.send(
-                            f"<@{next_sub['user_id']}> you have been moved to the **{class_name}** "
-                            f"slot on the Mix Team — the previous player signed out."
+                            f"<@{next_sub['user_id']}> you have been moved to the {slot_context}"
                         )
                 except Exception:
                     pass
 
-        # 1. Ping original hoster in hoster channel (not role ping, just the hoster)
+        # Ping hoster in hoster channel
         hoster_channel_id = getattr(client, "config", {}).get("hoster_channel_id")
         if hoster_channel_id:
             hoster_ch = client.get_channel(int(hoster_channel_id))
@@ -391,7 +467,7 @@ async def do_signout(client, match_id, user_id, class_name=None):
                     promoted_line = f" **{next_sub['username']}** has been moved to the main roster."
                 await hoster_ch.send(
                     f"<@{match['created_by']}> ⚠️ **{signup['username']}** has signed out of "
-                    f"**{class_name}** in <#{match['channel_id']}> ({team_name} vs Mix).{promoted_line}"
+                    f"**{class_name}** in <#{match['channel_id']}> ({match_label}).{promoted_line}"
                 )
 
     await refresh_message(client, match_id)
@@ -431,23 +507,32 @@ class SignOutButton(ui.Button):
         time_until = match["timestamp"] - time.time()
         within_hour = 0 < time_until <= 3600
 
+        # Determine which classes this player is on the main (first) roster slot
+        rostered_classes = set()
+        if within_hour:
+            for s in signups:
+                if s["status"] == "accepted":
+                    accepted_for_class = await db.get_accepted_signups_for_class(self.match_id, s["class_name"])
+                    if accepted_for_class and accepted_for_class[0]["user_id"] == interaction.user.id:
+                        rostered_classes.add(s["class_name"])
+
         if len(signups) == 1:
-            # Only one class — confirm or go straight to signout
-            if within_hour:
+            class_name = signups[0]["class_name"]
+            if within_hour and class_name in rostered_classes:
                 lp_warning = ""
                 if LOW_PRIORITY_ROLE_ID:
                     lp_warning = f"\n⚠️ You will receive the <@&{LOW_PRIORITY_ROLE_ID}> role if you fail to find a replacement."
-                view = SignOutConfirmView(self.match_id, interaction.user.id, signups[0]["class_name"])
+                view = SignOutConfirmView(self.match_id, interaction.user.id, class_name)
                 await interaction.followup.send(
                     f"⚠️ **Warning:** The match starts in less than 1 hour.{lp_warning}\nAre you sure?",
                     view=view, ephemeral=True,
                 )
             else:
-                await do_signout(interaction.client, self.match_id, interaction.user.id, signups[0]["class_name"])
+                await do_signout(interaction.client, self.match_id, interaction.user.id, class_name)
                 await interaction.followup.send("You have been signed out.", ephemeral=True)
         else:
-            # Multiple classes — show a picker
-            view = SignOutClassPickerView(self.match_id, interaction.user.id, signups, within_hour)
+            # Multiple classes — show a picker with All option
+            view = SignOutClassPickerView(self.match_id, interaction.user.id, signups, within_hour, rostered_classes)
             classes = ", ".join(f"**{s['class_name']}**" for s in signups)
             await interaction.followup.send(
                 f"You're signed up on {classes}. Which class do you want to sign out of?",
@@ -468,15 +553,6 @@ class PlayerDecisionView(ui.View):
 
     @ui.button(label="✅ Accept", style=discord.ButtonStyle.success)
     async def accept(self, interaction, button):
-        earliest_pending = await db.get_earliest_pending_for_class(self.match_id, self.class_name)
-        if earliest_pending and earliest_pending["id"] < self.signup_id:
-            await interaction.response.send_message(
-                f"⚠️ **{earliest_pending['username']}** signed up for **{self.class_name}** "
-                f"before **{self.username}**. Please review their sign-up first.",
-                ephemeral=True,
-            )
-            return
-
         current = await db.get_signup_by_id(self.signup_id)
         already = current and current["status"] == "accepted"
         filled  = await db.count_accepted_for_class(self.match_id, self.class_name)
@@ -524,9 +600,27 @@ class ClassButton(ui.Button):
             )
             return
 
+        # Block if already on the main roster for any class in this match
+        all_signups = await db.get_non_denied_signups_for_user(self.match_id, interaction.user.id)
+        for s in all_signups:
+            if s["status"] == "accepted":
+                accepted_for = await db.get_accepted_signups_for_class(self.match_id, s["class_name"])
+                if accepted_for and accepted_for[0]["user_id"] == interaction.user.id:
+                    await interaction.followup.send(
+                        f"You're already playing this match as **{s['class_name']}**.",
+                        ephemeral=True,
+                    )
+                    return
+
         # Block if already signed up (non-denied) for THIS specific class
         existing_class = await db.get_signup_by_user_and_class(self.match_id, interaction.user.id, self.class_name)
-        if existing_class and existing_class["status"] != "denied":
+        if existing_class:
+            if existing_class["status"] == "denied":
+                await interaction.followup.send(
+                    f"You've been denied for **{self.class_name}**. Please contact the hoster.",
+                    ephemeral=True,
+                )
+                return
             await interaction.followup.send(
                 f"You're already signed up for **{self.class_name}**. "
                 "Sign out of this class first if you want to change it.",
@@ -603,18 +697,32 @@ async def _do_signup(interaction, match_id, class_name):
         if hoster_channel_id:
             hoster_ch = interaction.client.get_channel(int(hoster_channel_id))
             if hoster_ch:
-                team_name  = match_row["team_name"] or "Mix"
-                # Ping both: the hoster of the new mix AND hosters of clashing mixes
+                match_type = match_row["type"]
+                if match_type in ("opug", "6s_opug"):
+                    this_match_label = f"{match_row['division'] or 'PUG'} PUG"
+                elif match_type == "6s_mix":
+                    this_match_label = f"{match_row['team_name'] or 'Mix'} vs Mix 6s"
+                else:
+                    this_match_label = f"{match_row['team_name'] or 'Mix'} vs Mix"
+
                 hoster_pings = {match_row["created_by"]}
                 for m in clashing:
                     hoster_pings.add(m["created_by"])
-                pings_str  = " ".join(f"<@{uid}>" for uid in hoster_pings)
-                clash_refs = ", ".join(
-                    f"<#{m['channel_id']}> against {m['team_name'] or 'Mix'}" for m in clashing
-                )
+                pings_str = " ".join(f"<@{uid}>" for uid in hoster_pings)
+
+                def clash_label(m):
+                    t = m["type"] if m["type"] else "mix"
+                    if t in ("opug", "6s_opug"):
+                        return f"<#{m['channel_id']}> ({m['division'] or 'PUG'} PUG)"
+                    elif t == "6s_mix":
+                        return f"<#{m['channel_id']}> ({m['team_name'] or 'Mix'} vs Mix 6s)"
+                    else:
+                        return f"<#{m['channel_id']}> ({m['team_name'] or 'Mix'} vs Mix)"
+
+                clash_refs = ", ".join(clash_label(m) for m in clashing)
                 await hoster_ch.send(
                     f"{pings_str} ⚠️ **{interaction.user.display_name}** signed up for **{class_name}** "
-                    f"in <#{match_row['channel_id']}> ({team_name} vs Mix) "
+                    f"in <#{match_row['channel_id']}> ({this_match_label}) "
                     f"but is already accepted in {clash_refs}."
                 )
 
@@ -646,11 +754,29 @@ class OPugClassButton(ui.Button):
             return
 
         existing_class = await db.get_signup_by_user_and_class(self.match_id, interaction.user.id, self.class_name)
-        if existing_class and existing_class["status"] != "denied":
+        if existing_class:
+            if existing_class["status"] == "denied":
+                await interaction.followup.send(
+                    f"You've been denied for **{self.class_name}**. Please contact the hoster.",
+                    ephemeral=True,
+                )
+                return
             await interaction.followup.send(
                 f"You're already signed up for **{self.class_name}**.", ephemeral=True
             )
             return
+
+        # Block if already on main roster for any class in this match
+        all_signups = await db.get_non_denied_signups_for_user(self.match_id, interaction.user.id)
+        for s in all_signups:
+            if s["status"] == "accepted":
+                accepted_for = await db.get_accepted_signups_for_class(self.match_id, s["class_name"])
+                if accepted_for and accepted_for[0]["user_id"] == interaction.user.id:
+                    await interaction.followup.send(
+                        f"You're already playing this match as **{s['class_name']}**.",
+                        ephemeral=True,
+                    )
+                    return
 
         # Clash check
         clashing = await db.get_accepted_matches_for_user(
@@ -752,7 +878,7 @@ class ConcludeConfirmView(ui.View):
                     seen.add(s["user_id"])
                     pings.append(f"<@{s['user_id']}>")
             ping_str = " ".join(pings)
-            if match["type"] == "opug":
+            if match["type"] in ("opug", "6s_opug"):
                 division = match["division"] or "PUG"
                 notice_text = f"🏁 **{division} PUG** has been concluded. Thanks for playing! 🫡"
             else:
@@ -764,8 +890,23 @@ class ConcludeConfirmView(ui.View):
         # Mark as ended FIRST so channel is freed regardless of archive success
         await db.end_match(self.match_id)
 
+        # For opug types, pass team split into archive so it shows RED/BLU layout
+        opug_split = None
+        if match["type"] in ("opug", "6s_opug"):
+            split = await db.get_team_split(self.match_id)
+            if split:
+                all_signups = await db.get_signups_for_match(self.match_id)
+                accepted_all = [s for s in all_signups if s["status"] == "accepted"]
+                red_uids = set(split["red"])
+                blu_uids = set(split["blu"])
+                opug_split = {
+                    "red":  [s for s in accepted_all if s["user_id"] in red_uids],
+                    "blu":  [s for s in accepted_all if s["user_id"] in blu_uids],
+                    "subs": [s for s in accepted_all if s["user_id"] not in red_uids and s["user_id"] not in blu_uids],
+                }
+
         # Archive (best effort)
-        await do_archive(interaction.client, self.match_id, concluded=True)
+        await do_archive(interaction.client, self.match_id, concluded=True, opug_split=opug_split)
         await interaction.followup.send("✅ Match concluded and archived.", ephemeral=True)
 
     @ui.button(label="Never mind", style=discord.ButtonStyle.secondary)
@@ -809,31 +950,43 @@ async def build_manage_text(match_id):
     match   = await db.get_match(match_id)
     team    = match["team_name"] or "Mix"
 
+    # Track earliest signup id per player for chronological sort
+    # signups are already ORDER BY id ASC so the first seen is always the minimum
     player_data = {}
     for s in signups:
         uid = s["user_id"]
         if uid not in player_data:
-            player_data[uid] = {"username": s["username"], "accepted": [], "pending": [], "denied": []}
-        player_data[uid][s["status"]].append(s["class_name"])
+            player_data[uid] = {"username": s["username"], "accepted": [], "pending": [], "denied": [], "min_id": s["id"]}
+        player_data[uid][s["status"]].append((s["id"], s["class_name"]))
 
+    class_list = SIXS_CLASSES if match["type"] in ("6s_mix", "6s_opug", "6s_fresh_pug") else TF2_CLASSES
+
+    # Sort each player's classes chronologically (by signup id)
     for uid in player_data:
         for key in ("accepted", "pending", "denied"):
-            player_data[uid][key].sort(key=lambda c: TF2_CLASSES.index(c) if c in TF2_CLASSES else 99)
+            player_data[uid][key].sort(key=lambda x: x[0])
+            player_data[uid][key] = [cls for _, cls in player_data[uid][key]]
 
     def fmt(classes):
         return ", ".join(classes) if classes else "\u2014"
 
-    if match["type"] == "opug":
+    if match["type"] in ("opug", "6s_opug"):
         division = match["division"] or "PUG"
         header = "**" + division + " PUG \u2014 signups**\n"
-    elif match["type"] == "fresh_pug":
+    elif match["type"] in ("fresh_pug", "6s_fresh_pug"):
         header = "**Fresh PUG \u2014 signups**\n"
+    elif match["type"] == "6s_mix":
+        header = "**" + team + " vs Mix 6s \u2014 signups**\n"
     else:
         header = "**" + team + " vs Mix \u2014 signups**\n"
     lines  = [header]
 
     accepted_players = [p for p in player_data.values() if p["accepted"]]
-    pending_players  = [p for p in player_data.values() if p["pending"]]
+    # Sort pending players chronologically by their earliest signup
+    pending_players  = sorted(
+        [p for p in player_data.values() if p["pending"]],
+        key=lambda p: p["min_id"]
+    )
     denied_players   = [p for p in player_data.values() if p["denied"] and not p["accepted"] and not p["pending"]]
 
     if accepted_players:
@@ -842,7 +995,7 @@ async def build_manage_text(match_id):
             lines.append("\u2022 **" + p["username"] + "** \u2014 " + fmt(p["accepted"]))
 
     if pending_players:
-        lines.append("\n\u23f3 **Pending:**")
+        lines.append("\n\u23f3 **Pending** *(chronological order)*:")
         for p in pending_players:
             lines.append("\u2022 **" + p["username"] + "** \u2014 " + fmt(p["pending"]))
 
@@ -860,10 +1013,12 @@ async def build_manage_text(match_id):
 
 class ClassDropdownSelect(ui.Select):
     """Dropdown to pick a class — only shows classes with pending signups."""
-    def __init__(self, match_id, pending_by_class):
+    def __init__(self, match_id, pending_by_class, is_sixs=False):
         self.match_id = match_id
+        self.is_sixs  = is_sixs
+        class_list    = SIXS_CLASSES if is_sixs else TF2_CLASSES
         options = []
-        for cls in TF2_CLASSES:
+        for cls in class_list:
             count = len(pending_by_class.get(cls, []))
             if count:
                 options.append(discord.SelectOption(
@@ -871,6 +1026,8 @@ class ClassDropdownSelect(ui.Select):
                     value=cls,
                     description=str(count) + " pending",
                 ))
+        if not options:
+            options = [discord.SelectOption(label="No pending", value="_none", description="No pending sign-ups")]
         super().__init__(
             placeholder="Select a class to review...",
             options=options,
@@ -891,7 +1048,7 @@ class ClassDropdownSelect(ui.Select):
             return
 
         view = PlayerPickView(self.match_id, class_name, class_pend)
-        text = "**" + class_name + "**  —  click a player to accept"
+        text = "**" + class_name + "**  —  click a player to accept *(chronological order)*"
         await interaction.response.edit_message(content=text, view=view)
 
 
@@ -906,6 +1063,7 @@ class LPConfirmView(ui.View):
 
     @ui.button(label="Yes, accept anyway", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction, button):
+        await interaction.response.defer(ephemeral=True)
         current = await db.get_signup_by_id(self.signup_id)
         already = current and current["status"] == "accepted"
         await _do_accept(interaction, self.match_id, self.signup_id, self.username, self.class_name, self.filled, already, current)
@@ -916,13 +1074,17 @@ class LPConfirmView(ui.View):
 
 
 async def _do_accept(interaction, match_id, signup_id, username, class_name, filled, already, current):
+    # Caller must have already deferred the interaction
     await db.update_signup_status(signup_id, "accepted")
 
     is_main_roster = filled == 0 and not already
-    if is_main_roster:
-        user_id = current["user_id"] if current else None
-        if user_id:
-            await db.remove_sub_slots_for_user(match_id, user_id, class_name)
+    user_id = current["user_id"] if current else None
+
+    if is_main_roster and user_id:
+        # Remove their accepted sub slots on other classes
+        await db.remove_sub_slots_for_user(match_id, user_id, class_name)
+        # Remove their pending signups on other classes (#2)
+        await db.remove_pending_slots_for_user(match_id, user_id, class_name)
 
     # Reorder roster so non-LP players have priority over LP players
     await reorder_class_roster(interaction.client, match_id, class_name)
@@ -930,12 +1092,27 @@ async def _do_accept(interaction, match_id, signup_id, username, class_name, fil
 
     # Check actual position after reorder to determine if on main roster or sub
     accepted_after = await db.get_accepted_signups_for_class(match_id, class_name)
-    user_id = current["user_id"] if current else None
     on_main = len(accepted_after) > 0 and accepted_after[0]["user_id"] == user_id
     result = "accepted on " + class_name if on_main else "added as sub"
-    await interaction.response.send_message(
+    await interaction.followup.send(
         "✅  " + username + " — " + result + ".", ephemeral=True
     )
+
+    # Ping player in thread (#3)
+    match = await db.get_match(match_id)
+    if match and user_id:
+        try:
+            thread_id = match["thread_id"]
+        except (IndexError, KeyError):
+            thread_id = None
+        if thread_id:
+            try:
+                thread = interaction.client.get_channel(thread_id)
+                if thread:
+                    role_str = f"**{class_name}**" + (" (sub)" if not on_main else "")
+                    await thread.send(f"<@{user_id}> you've been accepted as {role_str}! ✅")
+            except Exception:
+                pass
 
     # Refresh class view
     try:
@@ -943,7 +1120,7 @@ async def _do_accept(interaction, match_id, signup_id, username, class_name, fil
         class_pend = sorted([s for s in pending if s["class_name"] == class_name], key=lambda s: s["id"])
         if class_pend:
             view = PlayerPickView(match_id, class_name, class_pend)
-            text = "**" + class_name + "**  —  click a player to accept"
+            text = "**" + class_name + "**  —  click a player to accept *(chronological order)*"
             await interaction.message.edit(content=text, view=view)
         else:
             view = await ReviewView.create(match_id)
@@ -998,22 +1175,8 @@ class AcceptPlayerButton(ui.Button):
             )
             return
 
+        await interaction.response.defer(ephemeral=True)
         await _do_accept(interaction, self.match_id, self.signup_id, self.username, self.class_name, filled, already, current)
-
-        # Refresh the class view (message may have been dismissed — ignore if so)
-        try:
-            pending    = await db.get_pending_signups(self.match_id)
-            class_pend = sorted([s for s in pending if s["class_name"] == self.class_name], key=lambda s: s["id"])
-            if class_pend:
-                view = PlayerPickView(self.match_id, self.class_name, class_pend)
-                text = "**" + self.class_name + "**  —  click a player to accept"
-                await interaction.message.edit(content=text, view=view)
-            else:
-                view = await ReviewView.create(self.match_id)
-                text, _ = await build_manage_text(self.match_id)
-                await interaction.message.edit(content=text, view=view)
-        except Exception:
-            pass
 
 
 class DenyPlayerButton(ui.Button):
@@ -1030,9 +1193,10 @@ class DenyPlayerButton(ui.Button):
         self.class_name = class_name
 
     async def callback(self, interaction):
+        await interaction.response.defer(ephemeral=True)
         await db.update_signup_status(self.signup_id, "denied")
         await refresh_message(interaction.client, self.match_id)
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "❌  " + self.username + " denied for " + self.class_name + ".", ephemeral=True
         )
 
@@ -1040,7 +1204,7 @@ class DenyPlayerButton(ui.Button):
         class_pend = sorted([s for s in pending if s["class_name"] == self.class_name], key=lambda s: s["id"])
         if class_pend:
             view = PlayerPickView(self.match_id, self.class_name, class_pend)
-            text = "**" + self.class_name + "**  —  click a player to accept"
+            text = "**" + self.class_name + "**  —  click a player to accept *(chronological order)*"
             await interaction.message.edit(content=text, view=view)
         else:
             view = await ReviewView.create(self.match_id)
@@ -1073,13 +1237,285 @@ class ReviewView(ui.View):
     @classmethod
     async def create(cls, match_id):
         self    = cls(match_id)
+        match   = await db.get_match(match_id)
+        is_sixs = match["type"] in ("6s_opug", "6s_mix") if match else False
         pending = await db.get_pending_signups(match_id)
         pending_by_class = {}
         for s in pending:
             pending_by_class.setdefault(s["class_name"], []).append(s)
         if pending_by_class:
-            self.add_item(ClassDropdownSelect(match_id, pending_by_class))
+            self.add_item(ClassDropdownSelect(match_id, pending_by_class, is_sixs=is_sixs))
         return self
+
+
+# ── Deny review panel ─────────────────────────────────────────────────────────
+
+class DenyClassDropdownSelect(ui.Select):
+    """Dropdown to pick a class for denying — only shows classes with pending signups."""
+    def __init__(self, match_id, pending_by_class, is_sixs=False):
+        self.match_id = match_id
+        class_list    = SIXS_CLASSES if is_sixs else TF2_CLASSES
+        options = []
+        for cls in class_list:
+            count = len(pending_by_class.get(cls, []))
+            if count:
+                options.append(discord.SelectOption(
+                    label=cls,
+                    value=cls,
+                    description=str(count) + " pending",
+                ))
+        if not options:
+            options = [discord.SelectOption(label="No pending", value="_none", description="No pending sign-ups")]
+        super().__init__(
+            placeholder="Select a class to deny from...",
+            options=options,
+            min_values=1,
+            max_values=1,
+        )
+
+    async def callback(self, interaction):
+        class_name = self.values[0]
+        pending    = await db.get_pending_signups(self.match_id)
+        class_pend = sorted([s for s in pending if s["class_name"] == class_name], key=lambda s: s["id"])
+
+        if not class_pend:
+            await interaction.response.edit_message(
+                content="No pending sign-ups for **" + class_name + "** anymore.",
+                view=await DenyReviewView.create(self.match_id),
+            )
+            return
+
+        view = DenyPlayerPickView(self.match_id, class_name, class_pend)
+        text = "**" + class_name + "**  —  click a player to deny *(chronological order)*"
+        await interaction.response.edit_message(content=text, view=view)
+
+
+class DenyPlayerPickView(ui.View):
+    """Shows pending players as red buttons — click to deny."""
+    def __init__(self, match_id, class_name, pending_signups):
+        super().__init__(timeout=300)
+        self.match_id   = match_id
+        self.class_name = class_name
+        row = 0
+        for i, s in enumerate(pending_signups):
+            if i > 0 and i % 5 == 0:
+                row += 1
+            if row > 3:
+                break
+            self.add_item(DenyOnlyButton(match_id, s["id"], s["username"], class_name, row))
+        self.add_item(BackToDenyReviewButton(match_id, row=4))
+
+
+class DenyOnlyButton(ui.Button):
+    def __init__(self, match_id, signup_id, username, class_name, row):
+        super().__init__(
+            label=username,
+            style=discord.ButtonStyle.danger,
+            custom_id="dny:" + str(match_id) + ":" + str(signup_id),
+            row=row,
+        )
+        self.match_id   = match_id
+        self.signup_id  = signup_id
+        self.username   = username
+        self.class_name = class_name
+
+    async def callback(self, interaction):
+        await interaction.response.defer(ephemeral=True)
+        await db.update_signup_status(self.signup_id, "denied")
+        await refresh_message(interaction.client, self.match_id)
+        await interaction.followup.send(
+            "❌ " + self.username + " denied for **" + self.class_name + "**.", ephemeral=True
+        )
+        pending    = await db.get_pending_signups(self.match_id)
+        class_pend = sorted([s for s in pending if s["class_name"] == self.class_name], key=lambda s: s["id"])
+        try:
+            if class_pend:
+                view = DenyPlayerPickView(self.match_id, self.class_name, class_pend)
+                text = "**" + self.class_name + "**  —  click a player to deny *(chronological order)*"
+            else:
+                view = await DenyReviewView.create(self.match_id)
+                text, _ = await build_manage_text(self.match_id)
+            await interaction.edit_original_response(content=text, view=view)
+        except Exception:
+            pass
+
+
+class BackToDenyReviewButton(ui.Button):
+    def __init__(self, match_id, row):
+        super().__init__(
+            label="Back",
+            style=discord.ButtonStyle.secondary,
+            custom_id="back_deny_review:" + str(match_id),
+            row=row,
+        )
+        self.match_id = match_id
+
+    async def callback(self, interaction):
+        view = await DenyReviewView.create(self.match_id)
+        text, _ = await build_manage_text(self.match_id)
+        await interaction.response.edit_message(content=text, view=view)
+
+
+class DenyReviewView(ui.View):
+    """The deny panel — dropdown to pick a class."""
+    def __init__(self, match_id):
+        super().__init__(timeout=300)
+        self.match_id = match_id
+
+    @classmethod
+    async def create(cls, match_id):
+        self    = cls(match_id)
+        match   = await db.get_match(match_id)
+        is_sixs = match["type"] in ("6s_opug", "6s_mix") if match else False
+        pending = await db.get_pending_signups(match_id)
+        pending_by_class = {}
+        for s in pending:
+            pending_by_class.setdefault(s["class_name"], []).append(s)
+        if pending_by_class:
+            self.add_item(DenyClassDropdownSelect(match_id, pending_by_class, is_sixs=is_sixs))
+        return self
+
+
+# ── 6s Sign-up views ─────────────────────────────────────────────────────────
+
+class SixsClassButton(ui.Button):
+    def __init__(self, class_name, match_id):
+        super().__init__(
+            label=class_name,
+            emoji=SIXS_CLASS_EMOJI[class_name],
+            custom_id=f"sixs_signup:{match_id}:{class_name}",
+            style=discord.ButtonStyle.secondary,
+            row=SIXS_CLASSES.index(class_name) // 4,
+        )
+        self.class_name = class_name
+        self.match_id   = match_id
+
+    async def callback(self, interaction):
+        await interaction.response.defer(ephemeral=True)
+        match = await db.get_match(self.match_id)
+        if not match or match["ended"]:
+            await interaction.followup.send("This match has already ended.", ephemeral=True)
+            return
+        existing_class = await db.get_signup_by_user_and_class(self.match_id, interaction.user.id, self.class_name)
+        if existing_class:
+            if existing_class["status"] == "denied":
+                await interaction.followup.send(
+                    f"You've been denied for **{self.class_name}**. Please contact the hoster.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.followup.send(f"You're already signed up for **{self.class_name}**.", ephemeral=True)
+            return
+
+        # Block if already on main roster for any class in this match
+        all_signups = await db.get_non_denied_signups_for_user(self.match_id, interaction.user.id)
+        for s in all_signups:
+            if s["status"] == "accepted":
+                accepted_for = await db.get_accepted_signups_for_class(self.match_id, s["class_name"])
+                if accepted_for and accepted_for[0]["user_id"] == interaction.user.id:
+                    await interaction.followup.send(
+                        f"You're already playing this match as **{s['class_name']}**.",
+                        ephemeral=True,
+                    )
+                    return
+
+        clashing = await db.get_accepted_matches_for_user(
+            interaction.user.id, exclude_match_id=self.match_id, reference_timestamp=match["timestamp"]
+        )
+        if clashing:
+            clash_names = ", ".join(f"{m['team_name'] or 'a match'} (<#{m['channel_id']}>)" for m in clashing)
+            view = ClashConfirmView(self.match_id, self.class_name, clash_names)
+            await interaction.followup.send(
+                "⚠️ **Warning:** You are already accepted in " + clash_names + ". Sign up anyway?",
+                view=view, ephemeral=True
+            )
+            return
+        await _do_signup(interaction, self.match_id, self.class_name)
+
+
+class SixsSignupView(ui.View):
+    def __init__(self, match_id):
+        super().__init__(timeout=None)
+        for cls in SIXS_CLASSES:
+            self.add_item(SixsClassButton(cls, match_id))
+        self.add_item(SignOutButton(match_id))
+
+
+# ── 6s Split view ─────────────────────────────────────────────────────────────
+
+class SixsSwapClassButton(ui.Button):
+    def __init__(self, class_name, match_id, row):
+        super().__init__(
+            label=class_name,
+            emoji=SIXS_CLASS_EMOJI[class_name],
+            style=discord.ButtonStyle.secondary,
+            custom_id="sixs_swap:" + str(match_id) + ":" + class_name,
+            row=row,
+        )
+        self.class_name = class_name
+        self.match_id   = match_id
+
+    async def callback(self, interaction):
+        split    = await db.get_team_split(self.match_id)
+        signups  = await db.get_signups_for_match(self.match_id)
+        accepted = [s for s in signups if s["status"] == "accepted"]
+        if not split:
+            await interaction.response.send_message("No split data.", ephemeral=True)
+            return
+        red, blu = split["red"], split["blu"]
+        red_s = [s for s in accepted if s["user_id"] in red and s["class_name"] == self.class_name]
+        blu_s = [s for s in accepted if s["user_id"] in blu and s["class_name"] == self.class_name]
+        if not red_s or not blu_s:
+            await interaction.response.send_message("Can't swap — missing player on one side.", ephemeral=True)
+            return
+        red_uid, blu_uid = red_s[0]["user_id"], blu_s[0]["user_id"]
+        new_red = [blu_uid if u == red_uid else u for u in red]
+        new_blu = [red_uid if u == blu_uid else u for u in blu]
+        await db.save_team_split(self.match_id, new_red, new_blu)
+        red_team = [s for s in accepted if s["user_id"] in new_red]
+        blu_team = [s for s in accepted if s["user_id"] in new_blu]
+        text = build_6s_split_view_text(red_team, blu_team)
+        view = SixsSplitView(self.match_id, red_team, blu_team)
+        await interaction.response.edit_message(content=text, view=view)
+
+
+class SixsPostTeamsButton(ui.Button):
+    def __init__(self, match_id):
+        super().__init__(label="Post teams", style=discord.ButtonStyle.success,
+                         custom_id="sixs_post_teams:" + str(match_id), row=2)
+        self.match_id = match_id
+
+    async def callback(self, interaction):
+        await interaction.response.defer()
+        split    = await db.get_team_split(self.match_id)
+        signups  = await db.get_signups_for_match(self.match_id)
+        accepted = [s for s in signups if s["status"] == "accepted"]
+        match    = await db.get_match(self.match_id)
+        red_uids, blu_uids = split["red"], split["blu"]
+        red_team = [s for s in accepted if s["user_id"] in red_uids]
+        blu_team = [s for s in accepted if s["user_id"] in blu_uids]
+        subs     = [s for s in accepted if s["user_id"] not in red_uids and s["user_id"] not in blu_uids]
+        channel  = interaction.client.get_channel(match["channel_id"])
+        if channel:
+            await channel.send(build_6s_opug_teams_message(match, red_team, blu_team, subs))
+
+        await db.set_teams_posted(self.match_id)
+
+        try:
+            await interaction.message.delete()
+        except Exception:
+            pass
+        await interaction.followup.send("✅ Teams posted!", ephemeral=True)
+
+
+class SixsSplitView(ui.View):
+    def __init__(self, match_id, red_team, blu_team):
+        super().__init__(timeout=None)
+        self.match_id = match_id
+        for i, cls in enumerate(SIXS_CLASSES):
+            row = i // 4
+            self.add_item(SixsSwapClassButton(cls, match_id, row))
+        self.add_item(SixsPostTeamsButton(match_id))
 
 
 # ── OPUG Team Split ───────────────────────────────────────────────────────────
@@ -1182,6 +1618,8 @@ class PostTeamsButton(ui.Button):
         if channel:
             msg_text = build_opug_teams_message(match, red_team, blu_team, subs)
             await channel.send(msg_text)
+
+        await db.set_teams_posted(self.match_id)
 
         # Delete the balancing chat message
         try:
@@ -1347,7 +1785,7 @@ class ManageView(ui.View):
     async def create(cls, match_id):
         return cls(match_id)
 
-    @ui.button(label="Review pending sign-ups", style=discord.ButtonStyle.primary, row=0)
+    @ui.button(label="Accept players", style=discord.ButtonStyle.primary, row=0)
     async def review_pending(self, interaction, button):
         pending = await db.get_pending_signups(self.match_id)
         if not pending:
@@ -1355,6 +1793,16 @@ class ManageView(ui.View):
             return
         text, _ = await build_manage_text(self.match_id)
         view     = await ReviewView.create(self.match_id)
+        await interaction.response.send_message(text, view=view, ephemeral=True)
+
+    @ui.button(label="Deny players", style=discord.ButtonStyle.danger, row=0)
+    async def deny_players(self, interaction, button):
+        pending = await db.get_pending_signups(self.match_id)
+        if not pending:
+            await interaction.response.send_message("No pending sign-ups to deny right now.", ephemeral=True)
+            return
+        text, _ = await build_manage_text(self.match_id)
+        view     = await DenyReviewView.create(self.match_id)
         await interaction.response.send_message(text, view=view, ephemeral=True)
 
     @ui.button(label="Conclude match", style=discord.ButtonStyle.success, row=1)
@@ -1372,6 +1820,24 @@ class ManageView(ui.View):
                 ephemeral=True,
             )
             return
+        if match["type"] in ("opug", "6s_opug"):
+            split = await db.get_team_split(self.match_id)
+            if not split:
+                await interaction.response.send_message(
+                    "❌ Teams haven't been split yet. Use **Split teams** first, then post the teams before concluding.",
+                    ephemeral=True,
+                )
+                return
+            try:
+                teams_posted = match["teams_posted"]
+            except (IndexError, KeyError):
+                teams_posted = None
+            if not teams_posted:
+                await interaction.response.send_message(
+                    "❌ Teams have been split but not posted yet. Press **Post teams** in the balancing chat before concluding.",
+                    ephemeral=True,
+                )
+                return
         view = ConcludeConfirmView(self.match_id)
         await interaction.response.send_message(
             "Ready to conclude this match? This will post a conclusion notice, "
@@ -1382,7 +1848,7 @@ class ManageView(ui.View):
     @ui.button(label="Split teams", style=discord.ButtonStyle.primary, row=1)
     async def split_teams(self, interaction, button):
         match = await db.get_match(self.match_id)
-        if not match or match["type"] != "opug":
+        if not match or match["type"] not in ("opug", "6s_opug"):
             await interaction.response.send_message(
                 "❌ Team splitting is only available for Organised PUGs.", ephemeral=True
             )
@@ -1391,15 +1857,18 @@ class ManageView(ui.View):
         signups  = await db.get_signups_for_match(self.match_id)
         accepted = [s for s in signups if s["status"] == "accepted"]
 
-        # Count filled slots (2 per class = 18 total)
+        # Count filled slots
+        is_sixs     = match["type"] == "6s_opug"
+        class_list  = SIXS_CLASSES if is_sixs else TF2_CLASSES
+        cap         = 12 if is_sixs else 18
         slot_counts = {}
         for s in accepted:
             slot_counts[s["class_name"]] = slot_counts.get(s["class_name"], 0) + 1
         total = sum(min(v, 2) for v in slot_counts.values())
 
-        if total < 18:
+        if total < cap:
             await interaction.response.send_message(
-                f"❌ Not all 18 slots are filled yet ({total}/18). Please wait until all players have signed up.",
+                f"❌ Not all {cap} slots are filled yet ({total}/{cap}). Please wait until all players have signed up.",
                 ephemeral=True,
             )
             return
@@ -1407,7 +1876,7 @@ class ManageView(ui.View):
         # Default split: first accepted per class → RED, second → BLU
         red_uids = []
         blu_uids = []
-        for cls in TF2_CLASSES:
+        for cls in class_list:
             cls_players = [s for s in accepted if s["class_name"] == cls][:2]
             if len(cls_players) >= 1:
                 red_uids.append(cls_players[0]["user_id"])
@@ -1419,8 +1888,12 @@ class ManageView(ui.View):
         red_team = [s for s in accepted if s["user_id"] in red_uids]
         blu_team = [s for s in accepted if s["user_id"] in blu_uids]
 
-        text = build_split_view_text(red_team, blu_team)
-        view = SplitView(self.match_id, red_team, blu_team)
+        if is_sixs:
+            text = build_6s_split_view_text(red_team, blu_team)
+            view = SixsSplitView(self.match_id, red_team, blu_team)
+        else:
+            text = build_split_view_text(red_team, blu_team)
+            view = SplitView(self.match_id, red_team, blu_team)
 
         # Post to balancing chat
         bal_ch_id = interaction.client.config.get("balancing_chat_id")
@@ -1438,7 +1911,7 @@ class ManageView(ui.View):
     async def cancel_match(self, interaction, button):
         match = await db.get_match(self.match_id)
         # Warn if match already started — they should conclude instead
-        if match and match["type"] == "opug" and time.time() > match["timestamp"]:
+        if match and match["type"] in ("opug", "6s_opug") and time.time() > match["timestamp"]:
             view = OPugCancelAfterStartView(self.match_id)
             await interaction.response.send_message(
                 "⚠️ This PUG has already started. If the match was played, use **Conclude** instead.\n"
