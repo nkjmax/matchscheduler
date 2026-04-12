@@ -223,13 +223,14 @@ def build_denied_message(match, signups):
 
 def build_archive_message(match, signups):
     """Concise archive summary posted to the archive channel on match conclusion."""
+    ts = match["timestamp"]
+    ts_str = f"<t:{ts}:F> <t:{ts}:R>" if ts else "—"
+
     if match["type"] in ("fresh_pug", "6s_fresh_pug"):
         mode_str = "6s Fresh PUG" if match["type"] == "6s_fresh_pug" else "Fresh PUG"
         division = match["division"] or "Any"
         map_name = match["map_name"] or "—"
         hoster   = f"<@{match['created_by']}>"
-        ts       = match["timestamp"]
-        ts_str   = f"<t:{ts}:F>" if ts else "—"
         return (
             f"**{mode_str}** | {division} | {ts_str}\n"
             f"Maps: {map_name} | Hoster: {hoster}"
@@ -243,14 +244,12 @@ def build_archive_message(match, signups):
         map_name  = match["map_name"] or "—"
         server    = match["server"]   or "—"
         hoster    = f"<@{match['created_by']}>"
-        ts        = match["timestamp"]
-        ts_str    = f"<t:{ts}:F>" if ts else "—"
         mode_str  = "6s" if is_sixs else "HL"
         header    = f"**{division} PUG** ({mode_str}) | {ts_str}\nMap: {map_name} | Server: {server} | Hoster: {hoster}"
 
         def inline_team(team_signups):
             parts = []
-            for cls in cls_list:
+            for cls in cls_list:  # class order
                 players = [f"<@{s['user_id']}>" for s in team_signups if s["class_name"] == cls]
                 for p in players:
                     parts.append(f"{emoji_map[cls]} {p}")
@@ -258,10 +257,11 @@ def build_archive_message(match, signups):
 
         # Concluded with split teams (dict passed from ConcludeConfirmView)
         if isinstance(signups, dict) and "red" in signups and "blu" in signups:
-            subs_parts = [
-                f"{emoji_map.get(s['class_name'], s['class_name'])} <@{s['user_id']}>"
-                for s in signups.get("subs", [])
-            ]
+            subs_parts = []
+            for cls in cls_list:  # class order for subs too
+                for s in signups.get("subs", []):
+                    if s["class_name"] == cls:
+                        subs_parts.append(f"{emoji_map.get(cls, cls)} <@{s['user_id']}>")
             subs_str = " ".join(subs_parts) if subs_parts else "—"
             return (
                 f"{header}\n"
@@ -270,7 +270,7 @@ def build_archive_message(match, signups):
                 f"Subs: {subs_str}"
             )
         else:
-            # Cancelled — flat inline list, no team framing
+            # Cancelled — flat inline list in class order
             parts = []
             for cls in cls_list:
                 players = [f"<@{s['user_id']}>" for s in signups if s["status"] == "accepted" and s["class_name"] == cls]
@@ -279,36 +279,18 @@ def build_archive_message(match, signups):
             signups_str = " ".join(parts) if parts else "—"
             return f"{header}\nSignups: {signups_str}"
 
+    # Mix / 6s_mix
     team_name = match["team_name"] or "Mix"
     division  = match["division"]  or "—"
     map_name  = match["map_name"]  or "—"
     server    = match["server"]    or "—"
     hoster    = f"<@{match['created_by']}>"
-    ts        = match["timestamp"]
-    ts_str    = f"<t:{ts}:F>" if ts else "—"
 
     is_sixs_mix = match["type"] == "6s_mix"
     cls_list    = SIXS_CLASSES if is_sixs_mix else TF2_CLASSES
     emoji_map   = SIXS_CLASS_EMOJI if is_sixs_mix else CLASS_EMOJI
 
-    # Build accepted roster (first per class = starter, rest = sub)
-    seen = set()
-    roster_lines = []
-    sub_pings    = []
-    for s in signups:
-        if s["status"] != "accepted":
-            continue
-        emoji = emoji_map.get(s["class_name"], s["class_name"])
-        if s["class_name"] not in seen:
-            seen.add(s["class_name"])
-            roster_lines.append(f"{emoji} <@{s['user_id']}>")
-        else:
-            sub_pings.append(f"<@{s['user_id']}>")
-
-    roster_str = " ".join(roster_lines) if roster_lines else "—"
-    subs_str   = " ".join(sub_pings) if sub_pings else "—"
-
-    # Host team from stored roster
+    # Build host team in class order from stored roster
     host_roster_raw = match["host_roster"] if match["host_roster"] else None
     if host_roster_raw:
         host_entries = [e.strip() for e in host_roster_raw.split("\n")]
@@ -320,6 +302,24 @@ def build_archive_message(match, signups):
     else:
         host_team_str = "—"
 
+    # Build mix team roster in class order (first per class = starter, rest = sub)
+    seen = set()
+    roster_lines = []
+    sub_pings    = []
+    for cls in cls_list:  # class order
+        for s in signups:
+            if s["status"] != "accepted" or s["class_name"] != cls:
+                continue
+            emoji = emoji_map.get(cls, cls)
+            if cls not in seen:
+                seen.add(cls)
+                roster_lines.append(f"{emoji} <@{s['user_id']}>")
+            else:
+                sub_pings.append(f"<@{s['user_id']}>")
+
+    roster_str = " ".join(roster_lines) if roster_lines else "—"
+    subs_str   = " ".join(sub_pings) if sub_pings else "—"
+
     return (
         f"**{team_name} vs Mix** | {division} | {ts_str}\n"
         f"Map: {map_name} | Server: {server} | Hoster: {hoster}\n"
@@ -327,6 +327,23 @@ def build_archive_message(match, signups):
         f"**Mix Team:** {roster_str}\n"
         f"Subs: {subs_str}"
     )
+
+
+def build_fresh_pug_signup_list(signups):
+    """
+    Builds the numbered signup list message for fresh pugs.
+    signups: list of accepted signups ordered by accepted_at ASC (signup order).
+    Always shows at least '1.' even when empty.
+    """
+    # Filter to accepted, in order
+    players = [s for s in signups if s["status"] == "accepted"]
+    lines = ["> # SIGN UPS"]
+    if not players:
+        lines.append("> 1.")
+    else:
+        for i, s in enumerate(players, 1):
+            lines.append(f"> {i}. <@{s['user_id']}>")
+    return "\n".join(lines)
 
 
 def build_fresh_pug_message(match, pug_role_id=None):
@@ -721,21 +738,24 @@ def build_ongoing_line(match, guild_id=None, channel_id=None, signups=None):
     chan_mention = f"<#{cid}>" if cid else ""
     team_name   = match["team_name"] or match["created_by_name"].upper()
     kind        = match["type"].upper()
-    division = match["division"] or ""
+    division    = match["division"] or ""
+    server      = match["server"] or ""
+    server_part = f" | {server}" if server else ""
+
     if kind == "MIX":
-        label = f"**{team_name}** vs Mix | HL | {ts_full}  {ts_rel}"
+        label = f"**{team_name}** vs Mix | HL{server_part} | {ts_full}  {ts_rel}"
     elif kind == "FRESH_PUG":
         label = f"**Fresh PUG** | HL | {ts_full}  {ts_rel}"
     elif kind == "OPUG":
-        label = f"**{division} PUG** | HL | {ts_full}  {ts_rel}"
+        label = f"**{division} PUG** | HL{server_part} | {ts_full}  {ts_rel}"
     elif kind == "6S_MIX":
-        label = f"**{team_name}** vs Mix | 6s | {ts_full}  {ts_rel}"
+        label = f"**{team_name}** vs Mix | 6s{server_part} | {ts_full}  {ts_rel}"
     elif kind == "6S_OPUG":
-        label = f"**{division} PUG** | 6s | {ts_full}  {ts_rel}"
+        label = f"**{division} PUG** | 6s{server_part} | {ts_full}  {ts_rel}"
     elif kind == "6S_FRESH_PUG":
         label = f"**Fresh PUG 6v6** | {ts_full}  {ts_rel}"
     else:
-        label = f"**{team_name} PUG** | HL | {ts_full}  {ts_rel}"
+        label = f"**{team_name} PUG** | HL{server_part} | {ts_full}  {ts_rel}"
 
     line1 = f"> {label} | {chan_mention}"
 

@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS signups (
     username    TEXT    NOT NULL,
     class_name  TEXT    NOT NULL,
     team        TEXT    NOT NULL DEFAULT 'mix',
-    status      TEXT    DEFAULT 'pending'
+    status      TEXT    DEFAULT 'pending',
+    accepted_at INTEGER
 );
 """
 
@@ -69,6 +70,7 @@ async def init_db():
             ("pending_msg_id",     "INTEGER"),
             ("denied_msg_id",      "INTEGER"),
             ("ping_msg_id",        "INTEGER"),
+            ("signup_list_msg_id", "INTEGER"),
         ]:
             try:
                 await db.execute(f"ALTER TABLE matches ADD COLUMN {col} {definition}")
@@ -76,6 +78,10 @@ async def init_db():
                 pass
         try:
             await db.execute("ALTER TABLE signups ADD COLUMN team TEXT NOT NULL DEFAULT 'mix'")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE signups ADD COLUMN accepted_at INTEGER")
         except Exception:
             pass
         await db.commit()
@@ -160,18 +166,77 @@ async def set_ping_msg_id(match_id, msg_id):
         await db.execute("UPDATE matches SET ping_msg_id=? WHERE id=?", (msg_id, match_id))
         await db.commit()
 
+async def set_signup_list_msg_id(match_id, msg_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE matches SET signup_list_msg_id=? WHERE id=?", (msg_id, match_id))
+        await db.commit()
+
 async def remove_pending_slots_for_user(match_id, user_id, keep_class):
     """
     When a player is accepted on the main roster for keep_class,
-    delete all their pending signups on other classes in this match.
+    soft-delete their pending signups on other classes by setting status='cancelled'.
+    These can be restored later if the accept is undone.
     """
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            """DELETE FROM signups
+            """UPDATE signups SET status='cancelled'
                WHERE match_id=? AND user_id=? AND class_name!=? AND status='pending'""",
             (match_id, user_id, keep_class)
         )
         await db.commit()
+
+
+async def set_accepted_at(signup_id, value):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE signups SET accepted_at=? WHERE id=?", (value, signup_id))
+        await db.commit()
+
+
+async def batch_set_accepted_at(updates):
+    """
+    Update accepted_at for multiple signups in a single DB transaction.
+    updates: list of (signup_id, value) tuples.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executemany(
+            "UPDATE signups SET accepted_at=? WHERE id=?",
+            [(value, signup_id) for signup_id, value in updates]
+        )
+        await db.commit()
+
+
+async def move_accepted_to_pending(signup_id):
+    """Move a single accepted signup back to pending, clearing accepted_at."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE signups SET status='pending', accepted_at=NULL WHERE id=?",
+            (signup_id,)
+        )
+        await db.commit()
+
+
+async def restore_cancelled_to_pending(match_id, user_id):
+    """Restore all cancelled signups for a user in a match back to pending."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """UPDATE signups SET status='pending'
+               WHERE match_id=? AND user_id=? AND status='cancelled'""",
+            (match_id, user_id)
+        )
+        await db.commit()
+
+
+async def get_accepted_signups_for_class_with_user(match_id, class_name, user_id):
+    """Get the accepted signup row for a specific user+class combination."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT * FROM signups
+               WHERE match_id=? AND class_name=? AND user_id=? AND status='accepted'""",
+            (match_id, class_name, user_id)
+        ) as cur:
+            return await cur.fetchone()
+
 
 async def end_match(match_id):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -297,13 +362,20 @@ async def get_conclude_msg_for_channel(channel_id):
 async def add_signup(match_id, user_id, username, class_name, team="mix"):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        # Block only if already signed up (non-denied) for this exact class
+        # Block only if already signed up (non-denied, non-cancelled) for this exact class.
+        # Cancelled rows are invisible tombstones — delete them and allow re-signup.
         async with db.execute(
-            "SELECT id FROM signups WHERE match_id=? AND user_id=? AND class_name=? AND status != 'denied'",
+            "SELECT id, status FROM signups WHERE match_id=? AND user_id=? AND class_name=?",
             (match_id, user_id, class_name)
         ) as cur:
-            if await cur.fetchone():
-                return None
+            existing = await cur.fetchone()
+        if existing:
+            if existing["status"] in ("pending", "accepted"):
+                return None  # Already actively signed up
+            if existing["status"] == "cancelled":
+                # Clean up the stale cancelled row before re-inserting
+                await db.execute("DELETE FROM signups WHERE id=?", (existing["id"],))
+            # 'denied' rows: fall through and allow re-signup
         cur = await db.execute(
             "INSERT INTO signups (match_id, user_id, username, class_name, team) VALUES (?, ?, ?, ?, ?)",
             (match_id, user_id, username, class_name, team)
@@ -313,14 +385,32 @@ async def add_signup(match_id, user_id, username, class_name, team="mix"):
 
 async def update_signup_status(signup_id, status):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE signups SET status=? WHERE id=?", (status, signup_id))
+        if status == "accepted":
+            await db.execute(
+                "UPDATE signups SET status=?, accepted_at=? WHERE id=?",
+                (status, int(time.time()), signup_id)
+            )
+        else:
+            await db.execute("UPDATE signups SET status=? WHERE id=?", (status, signup_id))
         await db.commit()
 
 async def get_signups_for_match(match_id):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
+        # Single atomic query: accepted rows ordered by accepted_at ASC (LP priority),
+        # pending/denied rows ordered by id ASC (chronological signup order).
+        # Cancelled rows are excluded — they are invisible tombstones for restore purposes.
         async with db.execute(
-            "SELECT * FROM signups WHERE match_id=? ORDER BY id ASC", (match_id,)
+            """SELECT *,
+                  CASE WHEN status='accepted' THEN 0 ELSE 1 END AS sort_group
+               FROM signups
+               WHERE match_id=? AND status != 'cancelled'
+               ORDER BY
+                  sort_group ASC,
+                  CASE WHEN status='accepted' THEN accepted_at END ASC NULLS LAST,
+                  CASE WHEN status='accepted' THEN id END ASC,
+                  CASE WHEN status!='accepted' THEN id END ASC""",
+            (match_id,)
         ) as cur:
             return await cur.fetchall()
 
@@ -337,7 +427,7 @@ async def get_accepted_signups(match_id):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM signups WHERE match_id=? AND status='accepted' ORDER BY id ASC",
+            "SELECT * FROM signups WHERE match_id=? AND status='accepted' ORDER BY accepted_at ASC NULLS LAST, id ASC",
             (match_id,)
         ) as cur:
             return await cur.fetchall()
@@ -366,7 +456,7 @@ async def get_next_accepted_for_class(match_id, class_name, exclude_user_id):
         async with db.execute(
             """SELECT * FROM signups
                WHERE match_id=? AND class_name=? AND status='accepted' AND user_id != ?
-               ORDER BY id ASC LIMIT 1""",
+               ORDER BY accepted_at ASC NULLS LAST, id ASC LIMIT 1""",
             (match_id, class_name, exclude_user_id)
         ) as cur:
             return await cur.fetchone()
@@ -411,11 +501,13 @@ async def remove_signup(match_id, user_id, class_name=None):
         await db.commit()
 
 async def get_non_denied_signups_for_user(match_id, user_id):
-    """All non-denied signups for a user in a match (may be multiple classes)."""
+    """All active (pending or accepted) signups for a user in a match. Excludes denied and cancelled."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM signups WHERE match_id=? AND user_id=? AND status != 'denied' ORDER BY id ASC",
+            """SELECT * FROM signups
+               WHERE match_id=? AND user_id=? AND status NOT IN ('denied', 'cancelled')
+               ORDER BY id ASC""",
             (match_id, user_id)
         ) as cur:
             return await cur.fetchall()
@@ -504,13 +596,13 @@ async def count_unique_signedup_players(match_id):
             return row[0] if row else 0
 
 async def get_accepted_signups_for_class(match_id, class_name):
-    """All accepted signups for a specific class, in signup order (first = rostered, rest = subs)."""
+    """All accepted signups for a specific class, in priority order (non-LP by accepted_at first)."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             """SELECT * FROM signups
                WHERE match_id=? AND class_name=? AND status='accepted'
-               ORDER BY id ASC""",
+               ORDER BY accepted_at ASC NULLS LAST, id ASC""",
             (match_id, class_name)
         ) as cur:
             return await cur.fetchall()
@@ -518,12 +610,12 @@ async def get_accepted_signups_for_class(match_id, class_name):
 async def remove_sub_slots_for_user(match_id, user_id, keep_class):
     """
     When a player is promoted to main roster on keep_class,
-    delete all their other accepted sub signups in this match.
-    Pending signups on other classes are left alone.
+    soft-delete their other accepted sub signups by setting status='cancelled'.
+    These can be restored later if the accept is undone.
     """
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            """DELETE FROM signups
+            """UPDATE signups SET status='cancelled'
                WHERE match_id=? AND user_id=? AND class_name!=? AND status='accepted'""",
             (match_id, user_id, keep_class)
         )
@@ -544,16 +636,15 @@ async def get_match_by_id_for_user(user_id, match_id):
 async def get_accepted_signups_for_class_ordered(match_id, class_name):
     """
     Returns accepted signups for a class in priority order:
-    non-LP first (by signup time), then LP (by signup time).
-    Requires lp_user_ids set to be passed for sorting — returns raw list here,
-    sorting is done in views.py where we have guild context.
+    non-LP first (by accepted_at), then LP (by accepted_at).
+    LP sorting is done in views.py where we have guild context.
     """
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             """SELECT * FROM signups
                WHERE match_id=? AND class_name=? AND status='accepted'
-               ORDER BY id ASC""",
+               ORDER BY accepted_at ASC NULLS LAST, id ASC""",
             (match_id, class_name)
         ) as cur:
             return await cur.fetchall()

@@ -15,13 +15,13 @@ from views import SignupView, OPugSignupView, SixsSignupView, SixsSplitView
 
 DEFAULT_TZ    = "Asia/Singapore"  # GMT+8
 DATETIME_HINT = (
-    "Format: DD/MM/YY HH:MM AM/PM (GMT+8)\n"
-    "e.g. `25/3/25 8:00 PM`  `5/3/25 9PM`  `5/3/25 9pm`  `5/3/25 9 pm`"
+    "Format: DD/MM/YY or DD/MM/YYYY HH:MM AM/PM (GMT+8)\n"
+    "e.g. `25/3/25 8:00 PM`  `5/3/2025 9PM`  `5/3/25 9pm`  `5/3/25 9 pm`"
 )
 
-# Accepts: 25/3/25 8PM  25/3/25 8pm  25/3/25 8:30PM  25/3/25 8:30 pm  etc.
+# Accepts: 25/3/25 8PM  25/3/2025 8pm  25/3/25 8:30PM  25/3/2025 8:30 pm  etc.
 DT_RE = re.compile(
-    r"^(\d{1,2})/(\d{1,2})/(\d{2})\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)$",
+    r"^(\d{1,2})/(\d{1,2})/(\d{2}|\d{4})\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)$",
     re.IGNORECASE
 )
 
@@ -35,8 +35,11 @@ def parse_datetime(raw):
     m = DT_RE.match(raw.strip())
     if not m:
         return None
-    day, mon, yr2, hour, minute, ampm = m.groups()
-    day, mon, year = int(day), int(mon), 2000 + int(yr2)
+    day, mon, yr, hour, minute, ampm = m.groups()
+    day  = int(day)
+    mon  = int(mon)
+    yr   = int(yr)
+    year = yr if yr >= 100 else 2000 + yr
     hour   = int(hour)
     minute = int(minute) if minute else 0
     ampm   = ampm.upper()
@@ -845,8 +848,16 @@ class SixsFreshPugModal(ui.Modal, title="Schedule a 6s Fresh PUG"):
             division=self.division, map_name=map_name, server=None, pug_role_id=pug_role_id)
         match   = await db.get_match(match_id)
         content = build_6s_fresh_pug_message(match, pug_role_id=pug_role_id)
-        msg     = await channel.send(content)
+        from views import FreshPugSignupView
+        from embeds import build_fresh_pug_signup_list
+        view    = FreshPugSignupView(match_id)
+        msg     = await channel.send(content, view=view)
         await db.set_message_id(match_id, msg.id, channel.id)
+
+        # Post the signup list message below the main message
+        signup_list_msg = await channel.send(content=build_fresh_pug_signup_list([]))
+        await db.set_signup_list_msg_id(match_id, signup_list_msg.id)
+
         try:
             thread = await msg.create_thread(name="FRESH PUG 6v6", auto_archive_duration=1440)
             await db.set_thread_id(match_id, thread.id)
@@ -1104,8 +1115,15 @@ class FreshPugModal(ui.Modal, title="Schedule a Fresh PUG"):
 
         match   = await db.get_match(match_id)
         content = build_fresh_pug_message(match, pug_role_id=pug_role_id)
-        msg     = await channel.send(content)
+        from views import FreshPugSignupView
+        from embeds import build_fresh_pug_signup_list
+        view    = FreshPugSignupView(match_id)
+        msg     = await channel.send(content, view=view)
         await db.set_message_id(match_id, msg.id, channel.id)
+
+        # Post the signup list message below the main message
+        signup_list_msg = await channel.send(content=build_fresh_pug_signup_list([]))
+        await db.set_signup_list_msg_id(match_id, signup_list_msg.id)
 
         try:
             thread = await msg.create_thread(
@@ -1185,11 +1203,7 @@ class ConnectModal(ui.Modal, title="Post Connect String"):
         channel = interaction.client.get_channel(match["channel_id"])
 
         accepted = await db.get_accepted_signups(self.match_id)
-        seen, pings = set(), []
-        for s in accepted:
-            if s["class_name"] not in seen:
-                seen.add(s["class_name"])
-                pings.append(f"<@{s['user_id']}>")
+        pings    = await build_connect_pings(self.match_id, match, accepted)
 
         out_lines = []
         if connect:
@@ -1203,6 +1217,42 @@ class ConnectModal(ui.Modal, title="Post Connect String"):
 
         await channel.send("\n".join(out_lines))
         await interaction.followup.send("✅ Connect string posted!", ephemeral=True)
+
+
+async def build_connect_pings(match_id, match, accepted):
+    """
+    Build the list of user pings for a connect string post, based on match type:
+    - mix / 6s_mix: first accepted per class only (main roster = 9 or 6 players)
+    - opug / 6s_opug: all accepted players, deduped by user (up to 18 or 12)
+    - fresh_pug / 6s_fresh_pug: all signed-up players
+    """
+    match_type = match["type"]
+    seen_users  = set()
+    pings       = []
+
+    if match_type in ("mix", "6s_mix"):
+        # Only first accepted per class = main roster
+        seen_classes = set()
+        for s in accepted:
+            if s["class_name"] not in seen_classes:
+                seen_classes.add(s["class_name"])
+                if s["user_id"] not in seen_users:
+                    seen_users.add(s["user_id"])
+                    pings.append(f"<@{s['user_id']}>")
+    elif match_type in ("opug", "6s_opug"):
+        # All accepted players, deduped by user
+        for s in accepted:
+            if s["user_id"] not in seen_users:
+                seen_users.add(s["user_id"])
+                pings.append(f"<@{s['user_id']}>")
+    elif match_type in ("fresh_pug", "6s_fresh_pug"):
+        # All signed-up players (class_name="any", all accepted)
+        for s in accepted:
+            if s["user_id"] not in seen_users:
+                seen_users.add(s["user_id"])
+                pings.append(f"<@{s['user_id']}>")
+
+    return pings
 
 
 def get_auto_ping_ids(config, match):
@@ -1246,28 +1296,28 @@ async def send_ping(bot, match, pug_ping):
     """Build and send the ping message, deleting the previous one. Returns (success, error_str)."""
     match_id  = match["id"]
     is_sixs   = match["type"] in ("6s_mix", "6s_opug")
+    is_opug   = match["type"] in ("opug", "6s_opug")
     class_list = SIXS_CLASSES if is_sixs else TF2_CLASSES
     emoji_map  = SIXS_CLASS_EMOJI if is_sixs else CLASS_EMOJI
 
     signups  = await db.get_signups_for_match(match_id)
-    accepted = {}
-    for s in signups:
-        if s["status"] == "accepted" and s["class_name"] not in accepted:
-            accepted[s["class_name"]] = s["user_id"]
 
-    unfilled              = [cls for cls in class_list if cls not in accepted]
-    filled                = len(class_list) - len(unfilled)
-    # HL mix: last 3 classes; 6s mix: last 2 classes
-    almost_full_threshold = len(class_list) - (3 if not is_sixs else 2)
+    if is_opug:
+        # Ping ALL accepted players (up to 18/12 slots — 2 per class)
+        seen_pings = set()
+        pings_list = []
+        for s in signups:
+            if s["status"] == "accepted" and s["user_id"] not in seen_pings:
+                seen_pings.add(s["user_id"])
+                pings_list.append(s["user_id"])
 
-    if match["type"] in ("opug", "6s_opug"):
-        total_cap   = 12 if is_sixs else 18
-        # HL opug: last 6 slots (3 classes × 2); 6s opug: last 4 slots (2 classes × 2)
-        opug_threshold = total_cap - (6 if not is_sixs else 4)
+        # Build slot counts for messaging
         slot_counts = {}
         for s in signups:
             if s["status"] == "accepted":
                 slot_counts[s["class_name"]] = slot_counts.get(s["class_name"], 0) + 1
+        total_cap    = 12 if is_sixs else 18
+        opug_threshold = total_cap - (4 if is_sixs else 6)
         total_filled = sum(min(v, 2) for v in slot_counts.values())
         missing_cls  = [cls for cls in class_list if slot_counts.get(cls, 0) < 2]
         if total_filled >= opug_threshold:
@@ -1276,15 +1326,26 @@ async def send_ping(bot, match, pug_ping):
         else:
             division = match["division"] or "PUG"
             msg = f"{pug_ping} Need players for {division} PUG"
-    elif match["type"] in ("fresh_pug", "6s_fresh_pug"):
-        division = match["division"] or "PUG"
-        msg = f"{pug_ping} Need players for {division} Fresh PUG"
-    elif filled >= almost_full_threshold:
-        class_emojis = ", ".join(emoji_map[cls] for cls in unfilled)
-        msg = f"{pug_ping} Just {class_emojis} left"
     else:
-        team = match["team_name"] or "Mix"
-        msg  = f"{pug_ping} Need players against {team}"
+        # Mix types — ping only main roster (first accepted per class)
+        accepted = {}
+        for s in signups:
+            if s["status"] == "accepted" and s["class_name"] not in accepted:
+                accepted[s["class_name"]] = s["user_id"]
+
+        unfilled              = [cls for cls in class_list if cls not in accepted]
+        filled                = len(class_list) - len(unfilled)
+        almost_full_threshold = len(class_list) - (3 if not is_sixs else 2)
+
+        if match["type"] in ("fresh_pug", "6s_fresh_pug"):
+            division = match["division"] or "PUG"
+            msg = f"{pug_ping} Need players for {division} Fresh PUG"
+        elif filled >= almost_full_threshold:
+            class_emojis = ", ".join(emoji_map[cls] for cls in unfilled)
+            msg = f"{pug_ping} Just {class_emojis} left"
+        else:
+            team = match["team_name"] or "Mix"
+            msg  = f"{pug_ping} Need players against {team}"
 
     channel = bot.get_channel(match["channel_id"])
     if not channel:

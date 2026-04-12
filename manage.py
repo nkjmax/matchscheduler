@@ -3,7 +3,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import db
-from views import ManageView, SignupView, OPugSignupView, SixsSignupView, FreshPugManageView
+from views import ManageView, SignupView, OPugSignupView, SixsSignupView, FreshPugManageView, FreshPugSignupView
 
 
 def is_hoster(interaction):
@@ -25,6 +25,8 @@ class ManageCog(commands.Cog):
                 view = SixsSignupView(match["id"])
             elif match_type == "opug":
                 view = OPugSignupView(match["id"])
+            elif match_type in ("fresh_pug", "6s_fresh_pug"):
+                view = FreshPugSignupView(match["id"])
             else:
                 view = SignupView(match["id"])
             self.bot.add_view(view)

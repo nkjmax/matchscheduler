@@ -41,7 +41,6 @@ async def main():
 
     bot.config          = config
     bot.ongoing_channel = ONGOING_CHANNEL
-    bot._pending_connect = {}
     bot._pending_roster  = {}
 
     @bot.event
@@ -160,77 +159,6 @@ async def main():
 
                             from schedule import post_to_ongoing
                             await post_to_ongoing(bot, match["id"], channel.id)
-
-        if isinstance(message.channel, discord.DMChannel):
-            import time as _time
-            import re as _re
-            pending = bot._pending_connect.get(message.author.id)
-            if pending and _time.time() < pending["expires"]:
-                del bot._pending_connect[message.author.id]
-
-                connect = None
-                sdr     = None
-
-                if message.content:
-                    text = message.content
-
-                    def extract_section(t, header):
-                        pat = _re.compile(
-                            _re.escape(header) + r'[^\n]*\n+(?:`+\n?)?(connect[^\n`]+)',
-                            _re.IGNORECASE
-                        )
-                        m = pat.search(t)
-                        return m.group(1).strip() if m else None
-
-                    sdr     = extract_section(text, "SDR Connect String")
-                    connect = extract_section(text, "Connect String")
-                    if connect and sdr and connect == sdr:
-                        connect = None
-
-                    # Fallback
-                    if not connect or not sdr:
-                        for line in text.splitlines():
-                            line = line.strip().strip("`").strip()
-                            if not line.lower().startswith("connect"):
-                                continue
-                            if _re.match(r"connect 169\.254\.", line, _re.I):
-                                sdr = sdr or line
-                            elif _re.search(r":2702\d\b", line):
-                                pass  # SourceTV, skip
-                            else:
-                                connect = connect or line
-
-                if not connect and not sdr:
-                    await message.channel.send(
-                        "❌ Couldn't find connect strings. "
-                        "Try forwarding the message again, or copy-paste the full message text."
-                    )
-                    return
-
-                import db as _db
-                accepted = await _db.get_accepted_signups(pending["match_id"])
-                seen, pings = set(), []
-                for s in accepted:
-                    if s["class_name"] not in seen:
-                        seen.add(s["class_name"])
-                        pings.append(f"<@{s['user_id']}>")
-
-                out_lines = []
-                if pings:
-                    out_lines.append(" ".join(pings))
-                if connect:
-                    out_lines.append("**Connect String**")
-                    out_lines.append(f"```{connect}```")
-                if sdr:
-                    out_lines.append("**SDR Connect String**")
-                    out_lines.append(f"```{sdr}```")
-
-                ch = bot.get_channel(pending["channel_id"])
-                if ch:
-                    await ch.send("\n".join(out_lines))
-                    await message.channel.send(f"✅ Posted in {ch.mention}!")
-                else:
-                    await message.channel.send("❌ Couldn't find the match channel.")
 
     @bot.command()
     async def sync(ctx):

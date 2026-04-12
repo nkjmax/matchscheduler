@@ -1,3 +1,4 @@
+import asyncio
 import time
 import logging
 import discord
@@ -7,7 +8,8 @@ log = logging.getLogger("views")
 
 from embeds import (TF2_CLASSES, CLASS_EMOJI, build_mix_message, build_match_embed, build_archive_message,
     build_opug_teams_message, build_split_view_text, build_pending_message, build_denied_message,
-    SIXS_CLASSES, SIXS_CLASS_EMOJI, build_6s_opug_teams_message, build_6s_split_view_text)
+    SIXS_CLASSES, SIXS_CLASS_EMOJI, build_6s_opug_teams_message, build_6s_split_view_text,
+    build_fresh_pug_signup_list)
 import db
 
 LOW_PRIORITY_ROLE_ID = None  # set to your role ID integer if desired
@@ -31,24 +33,33 @@ async def is_lp(client, user_id):
 
 async def reorder_class_roster(client, match_id, class_name):
     """
-    After any accept, ensure non-LP players have priority over LP players.
-    If main roster slot is LP but a non-LP sub exists, swap them.
+    Enforce priority order for a class roster:
+    1. Non-LP players sorted by accepted_at ASC
+    2. LP players sorted by accepted_at ASC (always after all non-LP)
+    If the current DB order already matches, do nothing.
     """
     accepted = await db.get_accepted_signups_for_class(match_id, class_name)
     if len(accepted) < 2:
         return
 
-    lp_status = {}
-    for s in accepted:
-        lp_status[s["id"]] = await is_lp(client, s["user_id"])
+    # Check LP status for all players concurrently instead of sequentially
+    lp_results = await asyncio.gather(*[is_lp(client, s["user_id"]) for s in accepted])
+    lp_flags   = {s["id"]: result for s, result in zip(accepted, lp_results)}
 
-    main_roster = accepted[0]
-    subs        = accepted[1:]
+    # Sort: non-LP first (False=0 < True=1), within each group by accepted_at ASC
+    sorted_order = sorted(
+        accepted,
+        key=lambda s: (lp_flags[s["id"]], s["accepted_at"] if s["accepted_at"] is not None else float("inf"))
+    )
 
-    if lp_status[main_roster["id"]]:
-        non_lp_sub = next((s for s in subs if not lp_status[s["id"]]), None)
-        if non_lp_sub:
-            await db.swap_signup_order(dict(main_roster), dict(non_lp_sub))
+    # If already in correct order, nothing to do
+    if [s["id"] for s in sorted_order] == [s["id"] for s in accepted]:
+        return
+
+    # Re-assign accepted_at values in a single batched DB transaction
+    base    = min((s["accepted_at"] for s in accepted if s["accepted_at"] is not None), default=int(time.time()))
+    updates = [(s["id"], base + i) for i, s in enumerate(sorted_order)]
+    await db.batch_set_accepted_at(updates)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -118,7 +129,7 @@ async def archive_thread_to_channel(client, match, archive_ch, archive_summary_m
     """
     Fetch all messages from the match thread and re-post them
     as a new thread on the archive summary message.
-    Skips bot messages that are just the connect string ping.
+    Raises on critical failures so callers can handle retries correctly.
     """
     if not match["thread_id"]:
         return
@@ -128,27 +139,34 @@ async def archive_thread_to_channel(client, match, archive_ch, archive_summary_m
         try:
             thread = await client.fetch_channel(match["thread_id"])
         except Exception:
-            return
+            return  # Thread gone — not a retriable error, just skip
 
     # Collect all messages chronologically
     messages = []
     try:
         async for msg in thread.history(limit=500, oldest_first=True):
             messages.append(msg)
-    except Exception:
-        return
+    except Exception as e:
+        raise RuntimeError(f"Failed to fetch thread history: {e}")
 
     if not messages:
         return
 
-    # Create an archive thread on the summary message
-    team = match["team_name"] or "Mix"
+    # Build thread name based on match type
+    match_type = match["type"] if match["type"] else "mix"
+    if match_type in ("opug", "6s_opug"):
+        thread_log_name = f"{match['division'] or 'PUG'} PUG — thread log"
+    elif match_type == "6s_mix":
+        thread_log_name = f"{match['team_name'] or 'Mix'} vs Mix 6s — thread log"
+    elif match_type in ("fresh_pug", "6s_fresh_pug"):
+        thread_log_name = "Fresh PUG — thread log"
+    else:
+        thread_log_name = f"{match['team_name'] or 'Mix'} vs Mix — thread log"
+
     try:
-        archive_thread = await archive_summary_msg.create_thread(
-            name=f"{team} vs Mix — thread log"
-        )
-    except Exception:
-        return
+        archive_thread = await archive_summary_msg.create_thread(name=thread_log_name)
+    except Exception as e:
+        raise RuntimeError(f"Failed to create archive thread: {e}")
 
     # Re-post each message
     for msg in messages:
@@ -171,7 +189,7 @@ async def archive_thread_to_channel(client, match, archive_ch, archive_summary_m
             except Exception:
                 pass
 
-        # Re-attach embeds as descriptions
+        # Re-attach embeds
         for embed in msg.embeds:
             try:
                 await archive_thread.send(embed=embed)
@@ -182,37 +200,35 @@ async def archive_thread_to_channel(client, match, archive_ch, archive_summary_m
 async def do_archive(client, match_id, concluded: bool, opug_split=None):
     """
     Shared archive logic for both conclude and cancel.
-    Posts summary to archive channel, creates archive thread with message log,
-    then locks and archives the original thread.
-    opug_split: {"red": [...], "blu": [...], "subs": [...]} for concluded opugs
+    Split into two phases so retries don't duplicate the summary message:
+    - Phase 1: post summary (raises on failure)
+    - Phase 2: post thread log and lock original (best effort, non-raising)
     """
-    import logging
-    log = logging.getLogger("discord")
-
     match   = await db.get_match(match_id)
     signups = await db.get_signups_for_match(match_id) if opug_split is None else opug_split
 
     archive_channel_id = client.config.get("archive_channel_id")
     if not archive_channel_id:
-        log.warning("do_archive: no archive_channel_id in config")
-        return
+        raise RuntimeError("do_archive: no archive_channel_id in config")
 
     archive_ch = client.get_channel(int(archive_channel_id))
     if not archive_ch:
-        log.warning(f"do_archive: could not find archive channel {archive_channel_id}")
-        return
+        raise RuntimeError(f"do_archive: could not find archive channel {archive_channel_id}")
 
     status_line = "🏁 Concluded" if concluded else "❌ Cancelled"
     summary     = build_archive_message(match, signups)
     full_text   = f"{status_line}\n{summary}"
 
-    # Post the summary message — we'll create a thread on it for the log
+    # Phase 1: post summary — if this fails, raise so retry logic triggers
     archive_msg = await archive_ch.send(full_text)
 
-    # Archive thread messages into a sub-thread on the archive message
-    await archive_thread_to_channel(client, match, archive_ch, archive_msg)
+    # Phase 2: thread log and locking — best effort, errors logged but not raised
+    # (summary is already posted; we don't want to duplicate it on retry)
+    try:
+        await archive_thread_to_channel(client, match, archive_ch, archive_msg)
+    except Exception as e:
+        log.warning(f"do_archive: thread log failed for match #{match_id}: {e}")
 
-    # Lock and archive the original thread
     if match["thread_id"]:
         try:
             thread = client.get_channel(match["thread_id"])
@@ -222,8 +238,81 @@ async def do_archive(client, match_id, concluded: bool, opug_split=None):
                 await thread.edit(locked=True)
                 await thread.edit(archived=True)
         except Exception as e:
-            import logging
-            logging.getLogger("discord").warning(f"Failed to lock/archive thread {match['thread_id']}: {e}")
+            log.warning(f"do_archive: failed to lock/archive thread {match['thread_id']}: {e}")
+
+
+async def _archive_task(client, match_id, concluded, opug_split, hoster_ch, status_msg, match_label, triggered_by):
+    """
+    Background coroutine that runs do_archive with retries.
+    Posts status updates to hoster_ch by editing status_msg.
+    """
+    ping = f"<@{triggered_by}> " if triggered_by else ""
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await do_archive(client, match_id, concluded=concluded, opug_split=opug_split)
+            try:
+                await status_msg.edit(content=f"✅ {ping}{match_label} thread archived.")
+            except Exception:
+                pass
+            return
+        except Exception as e:
+            log.warning(f"_archive_task attempt {attempt}/{max_attempts} failed for match #{match_id}: {e}")
+            if attempt < max_attempts:
+                await asyncio.sleep(3)
+
+    # All retries exhausted
+    try:
+        await status_msg.edit(content=f"❌ {ping}Archiving failed for {match_label} (match #{match_id}). Please check logs.")
+    except Exception:
+        pass
+
+
+def fire_archive_task(client, match_id, concluded, opug_split=None, hoster_channel_id=None, triggered_by=None):
+    """
+    Fire do_archive as a background task. Posts 'Archiving...' to hoster channel
+    pinging the triggering hoster, and edits it to success/failure when done.
+    """
+    hoster_ch = client.get_channel(int(hoster_channel_id)) if hoster_channel_id else None
+
+    # Build match label for status messages
+    async def _get_label():
+        match = await db.get_match(match_id)
+        if not match:
+            return f"match #{match_id}"
+        t = match["type"]
+        if t in ("opug", "6s_opug"):
+            return f"{match['division'] or 'PUG'} PUG"
+        elif t == "6s_mix":
+            return f"{match['team_name'] or 'Mix'} vs Mix 6s"
+        elif t in ("fresh_pug", "6s_fresh_pug"):
+            return "Fresh PUG" if t == "fresh_pug" else "Fresh PUG 6v6"
+        else:
+            return f"{match['team_name'] or 'Mix'} vs Mix"
+
+    async def _run():
+        match_label = await _get_label()
+        ping = f"<@{triggered_by}> " if triggered_by else ""
+        status_msg = None
+        if hoster_ch:
+            try:
+                status_msg = await hoster_ch.send(f"🔄 {ping}Archiving {match_label} thread...")
+            except Exception:
+                pass
+        if status_msg:
+            await _archive_task(client, match_id, concluded, opug_split, hoster_ch, status_msg, match_label, triggered_by)
+        else:
+            # No hoster channel — run archive silently with retries
+            for attempt in range(1, 4):
+                try:
+                    await do_archive(client, match_id, concluded=concluded, opug_split=opug_split)
+                    return
+                except Exception as e:
+                    log.warning(f"fire_archive_task attempt {attempt}/3 failed for match #{match_id}: {e}")
+                    if attempt < 3:
+                        await asyncio.sleep(3)
+
+    asyncio.create_task(_run())
 
 
 async def do_cancel(client, match_id):
@@ -235,15 +324,10 @@ async def do_cancel(client, match_id):
     pings    = " ".join(dict.fromkeys(f"<@{s['user_id']}>" for s in accepted))
     channel  = client.get_channel(match["channel_id"])
 
-    # Delete ALL bot messages in the channel (connect strings, embeds, everything)
+    # Bulk delete all bot messages in the channel
     if channel:
         try:
-            async for msg in channel.history(limit=200, oldest_first=True):
-                if msg.author.id == client.user.id:
-                    try:
-                        await msg.delete()
-                    except Exception:
-                        pass
+            await channel.purge(limit=200, check=lambda m: m.author.id == client.user.id)
         except Exception:
             pass
 
@@ -259,9 +343,6 @@ async def do_cancel(client, match_id):
 
     # Mark as ended FIRST so channel is freed up regardless of archive success
     await db.end_match(match_id)
-
-    # Archive (best effort — errors won't block the cancel)
-    await do_archive(client, match_id, concluded=False)
 
     match_type = match["type"]
     if match_type in ("mix", "6s_mix"):
@@ -289,6 +370,12 @@ async def do_cancel(client, match_id):
             embed=cancel_embed,
         )
         await db.cancel_match(match_id, notice.id)
+
+    # Fire archive in background
+    hoster_channel_id = client.config.get("hoster_channel_id")
+    fire_archive_task(client, match_id, concluded=False,
+                      hoster_channel_id=hoster_channel_id,
+                      triggered_by=match["created_by"])
 
     return True
 
@@ -419,16 +506,22 @@ async def do_signout(client, match_id, user_id, class_name=None):
 
     class_name   = signup["class_name"]
     was_accepted = signup["status"] == "accepted"
-    # Check if this player is the FIRST accepted (rostered, not sub)
+    match        = await db.get_match(match_id)
+    match_type   = match["type"] if match else "mix"
+    is_opug      = match_type in ("opug", "6s_opug")
+
+    # Check if this player is on the main roster (first slot for mix, first 2 for opug)
     accepted_for_class = await db.get_accepted_signups_for_class(match_id, class_name)
-    is_rostered = was_accepted and len(accepted_for_class) > 0 and accepted_for_class[0]["user_id"] == user_id
+    if is_opug:
+        main_uids  = [s["user_id"] for s in accepted_for_class[:2]]
+        is_rostered = was_accepted and user_id in main_uids
+    else:
+        is_rostered = was_accepted and len(accepted_for_class) > 0 and accepted_for_class[0]["user_id"] == user_id
 
     await db.remove_signup(match_id, user_id, class_name)
 
-    match        = await db.get_match(match_id)
     channel      = client.get_channel(match["channel_id"]) if match else None
     channel_name = channel.name if channel else "the match channel"
-    match_type   = match["type"] if match else "mix"
 
     if match_type in ("opug", "6s_opug"):
         match_label = f"{match['division'] or 'PUG'} PUG"
@@ -607,7 +700,8 @@ class ClassButton(ui.Button):
                 accepted_for = await db.get_accepted_signups_for_class(self.match_id, s["class_name"])
                 if accepted_for and accepted_for[0]["user_id"] == interaction.user.id:
                     await interaction.followup.send(
-                        f"You're already playing this match as **{s['class_name']}**.",
+                        f"You're already on the main roster as **{s['class_name']}**. "
+                        "Sign out first if you want to change classes.",
                         ephemeral=True,
                     )
                     return
@@ -766,19 +860,19 @@ class OPugClassButton(ui.Button):
             )
             return
 
-        # Block if already on main roster for any class in this match
+        # Block if already on main roster (first 2 slots) for any class in this match
         all_signups = await db.get_non_denied_signups_for_user(self.match_id, interaction.user.id)
         for s in all_signups:
             if s["status"] == "accepted":
                 accepted_for = await db.get_accepted_signups_for_class(self.match_id, s["class_name"])
-                if accepted_for and accepted_for[0]["user_id"] == interaction.user.id:
+                main_uids = [a["user_id"] for a in accepted_for[:2]]
+                if interaction.user.id in main_uids:
                     await interaction.followup.send(
-                        f"You're already playing this match as **{s['class_name']}**.",
+                        f"You're already on the main roster as **{s['class_name']}**. "
+                        "Sign out first if you want to change classes.",
                         ephemeral=True,
                     )
                     return
-
-        # Clash check
         clashing = await db.get_accepted_matches_for_user(
             interaction.user.id,
             exclude_match_id=self.match_id,
@@ -847,15 +941,10 @@ class ConcludeConfirmView(ui.View):
 
         channel = interaction.client.get_channel(match["channel_id"])
 
-        # Delete ALL bot messages in the match channel
+        # Bulk delete all bot messages in the match channel
         if channel:
             try:
-                async for msg in channel.history(limit=200, oldest_first=True):
-                    if msg.author.id == interaction.client.user.id:
-                        try:
-                            await msg.delete()
-                        except Exception:
-                            pass
+                await channel.purge(limit=200, check=lambda m: m.author.id == interaction.client.user.id)
             except Exception:
                 pass
 
@@ -890,24 +979,27 @@ class ConcludeConfirmView(ui.View):
         # Mark as ended FIRST so channel is freed regardless of archive success
         await db.end_match(self.match_id)
 
-        # For opug types, pass team split into archive so it shows RED/BLU layout
+        # Build opug_split before firing background task
         opug_split = None
         if match["type"] in ("opug", "6s_opug"):
             split = await db.get_team_split(self.match_id)
             if split:
-                all_signups = await db.get_signups_for_match(self.match_id)
+                all_signups  = await db.get_signups_for_match(self.match_id)
                 accepted_all = [s for s in all_signups if s["status"] == "accepted"]
-                red_uids = set(split["red"])
-                blu_uids = set(split["blu"])
-                opug_split = {
+                red_uids     = set(split["red"])
+                blu_uids     = set(split["blu"])
+                opug_split   = {
                     "red":  [s for s in accepted_all if s["user_id"] in red_uids],
                     "blu":  [s for s in accepted_all if s["user_id"] in blu_uids],
                     "subs": [s for s in accepted_all if s["user_id"] not in red_uids and s["user_id"] not in blu_uids],
                 }
 
-        # Archive (best effort)
-        await do_archive(interaction.client, self.match_id, concluded=True, opug_split=opug_split)
-        await interaction.followup.send("✅ Match concluded and archived.", ephemeral=True)
+        # Fire archive in background — hoster gets instant feedback
+        hoster_channel_id = interaction.client.config.get("hoster_channel_id")
+        fire_archive_task(interaction.client, self.match_id, concluded=True,
+                          opug_split=opug_split, hoster_channel_id=hoster_channel_id,
+                          triggered_by=interaction.user.id)
+        await interaction.followup.send("✅ Match concluded. Archiving in background...", ephemeral=True)
 
     @ui.button(label="Never mind", style=discord.ButtonStyle.secondary)
     async def abort(self, interaction, button):
@@ -1077,13 +1169,22 @@ async def _do_accept(interaction, match_id, signup_id, username, class_name, fil
     # Caller must have already deferred the interaction
     await db.update_signup_status(signup_id, "accepted")
 
-    is_main_roster = filled == 0 and not already
+    match = await db.get_match(match_id)
+    is_opug = match and match["type"] in ("opug", "6s_opug")
+
+    # For OPUGs: 2 slots per class, so "main roster" means filled < 2
+    # For mixes: 1 slot per class, so "main roster" means filled == 0
+    if is_opug:
+        is_main_roster = filled < 2 and not already
+    else:
+        is_main_roster = filled == 0 and not already
+
     user_id = current["user_id"] if current else None
 
     if is_main_roster and user_id:
         # Remove their accepted sub slots on other classes
         await db.remove_sub_slots_for_user(match_id, user_id, class_name)
-        # Remove their pending signups on other classes (#2)
+        # Remove their pending signups on other classes
         await db.remove_pending_slots_for_user(match_id, user_id, class_name)
 
     # Reorder roster so non-LP players have priority over LP players
@@ -1092,14 +1193,19 @@ async def _do_accept(interaction, match_id, signup_id, username, class_name, fil
 
     # Check actual position after reorder to determine if on main roster or sub
     accepted_after = await db.get_accepted_signups_for_class(match_id, class_name)
-    on_main = len(accepted_after) > 0 and accepted_after[0]["user_id"] == user_id
+    if is_opug:
+        # For OPUGs, first 2 slots are main roster; 3rd+ are subs
+        main_uids = [s["user_id"] for s in accepted_after[:2]]
+        on_main = user_id in main_uids
+    else:
+        on_main = len(accepted_after) > 0 and accepted_after[0]["user_id"] == user_id
+
     result = "accepted on " + class_name if on_main else "added as sub"
     await interaction.followup.send(
         "✅  " + username + " — " + result + ".", ephemeral=True
     )
 
-    # Ping player in thread (#3)
-    match = await db.get_match(match_id)
+    # Ping player in thread
     if match and user_id:
         try:
             thread_id = match["thread_id"]
@@ -1109,7 +1215,10 @@ async def _do_accept(interaction, match_id, signup_id, username, class_name, fil
             try:
                 thread = interaction.client.get_channel(thread_id)
                 if thread:
-                    role_str = f"**{class_name}**" + (" (sub)" if not on_main else "")
+                    if on_main:
+                        role_str = f"**{class_name}**"
+                    else:
+                        role_str = f"**{class_name}** (sub)"
                     await thread.send(f"<@{user_id}> you've been accepted as {role_str}! ✅")
             except Exception:
                 pass
@@ -1414,7 +1523,8 @@ class SixsClassButton(ui.Button):
                 accepted_for = await db.get_accepted_signups_for_class(self.match_id, s["class_name"])
                 if accepted_for and accepted_for[0]["user_id"] == interaction.user.id:
                     await interaction.followup.send(
-                        f"You're already playing this match as **{s['class_name']}**.",
+                        f"You're already on the main roster as **{s['class_name']}**. "
+                        "Sign out first if you want to change classes.",
                         ephemeral=True,
                     )
                     return
@@ -1662,8 +1772,136 @@ class OPugCancelAfterStartView(ui.View):
         await interaction.response.edit_message(content="Cancellation aborted.", view=None)
 
 
+# ── Fresh PUG signup ──────────────────────────────────────────────────────────
+
+async def refresh_fresh_pug_signup_list(client, match_id):
+    """Edit the signup list message for a fresh pug to reflect current signups."""
+    match = await db.get_match(match_id)
+    if not match:
+        return
+    try:
+        signup_list_msg_id = match["signup_list_msg_id"]
+    except (IndexError, KeyError):
+        signup_list_msg_id = None
+    if not signup_list_msg_id:
+        return
+    channel = client.get_channel(match["channel_id"])
+    if not channel:
+        return
+    try:
+        signups = await db.get_signups_for_match(match_id)
+        msg     = await channel.fetch_message(signup_list_msg_id)
+        await msg.edit(content=build_fresh_pug_signup_list(signups))
+    except Exception as e:
+        log.warning(f"refresh_fresh_pug_signup_list failed for match #{match_id}: {e}")
+
+
+class FreshPugSignupButton(ui.Button):
+    def __init__(self, match_id):
+        super().__init__(
+            label="Sign Up",
+            emoji=discord.PartialEmoji.from_str("<:PUG:1367589835874893885>"),
+            custom_id=f"fp_signup:{match_id}",
+            style=discord.ButtonStyle.primary,
+            row=0,
+        )
+        self.match_id = match_id
+
+    async def callback(self, interaction):
+        await interaction.response.defer(ephemeral=True)
+        match = await db.get_match(self.match_id)
+
+        if not match or match["ended"]:
+            await interaction.followup.send(
+                "This Fresh PUG has already ended or been cancelled.", ephemeral=True
+            )
+            return
+
+        # Check if already signed up
+        existing = await db.get_signup_by_user_and_class(self.match_id, interaction.user.id, "any")
+        if existing and existing["status"] != "denied":
+            await interaction.followup.send(
+                "You're already signed up for this Fresh PUG.", ephemeral=True
+            )
+            return
+
+        signup_id = await db.add_signup(
+            self.match_id, interaction.user.id,
+            interaction.user.display_name, "any",
+        )
+        if signup_id is None:
+            await interaction.followup.send("Could not sign up. Try again.", ephemeral=True)
+            return
+
+        # Auto-accept — fresh pug signups are always accepted immediately
+        await db.update_signup_status(signup_id, "accepted")
+
+        # Check if cap just hit — ping hoster once
+        is_sixs = match["type"] == "6s_fresh_pug"
+        cap     = 12 if is_sixs else 18
+        signups = await db.get_signups_for_match(self.match_id)
+        count   = len([s for s in signups if s["status"] == "accepted"])
+
+        if count == cap:
+            hoster_channel_id = getattr(interaction.client, "config", {}).get("hoster_channel_id")
+            if hoster_channel_id:
+                hoster_ch = interaction.client.get_channel(int(hoster_channel_id))
+                if hoster_ch:
+                    mode = "6s Fresh PUG" if is_sixs else "Fresh PUG"
+                    try:
+                        await hoster_ch.send(
+                            f"<@{match['created_by']}> 🎉 **{mode}** is full! ({cap}/{cap})"
+                        )
+                    except Exception:
+                        pass
+
+        await refresh_fresh_pug_signup_list(interaction.client, self.match_id)
+        await interaction.followup.send("✅ You're signed up!", ephemeral=True)
+
+
+class FreshPugSignOutButton(ui.Button):
+    def __init__(self, match_id):
+        super().__init__(
+            label="Sign Out",
+            emoji="🚪",
+            custom_id=f"fp_signout:{match_id}",
+            style=discord.ButtonStyle.danger,
+            row=0,
+        )
+        self.match_id = match_id
+
+    async def callback(self, interaction):
+        await interaction.response.defer(ephemeral=True)
+        match = await db.get_match(self.match_id)
+
+        if not match or match["ended"]:
+            await interaction.followup.send(
+                "This Fresh PUG has already ended or been cancelled.", ephemeral=True
+            )
+            return
+
+        existing = await db.get_signup_by_user_and_class(self.match_id, interaction.user.id, "any")
+        if not existing or existing["status"] == "denied":
+            await interaction.followup.send(
+                "You're not signed up for this Fresh PUG.", ephemeral=True
+            )
+            return
+
+        await db.remove_signup(self.match_id, interaction.user.id, "any")
+        await refresh_fresh_pug_signup_list(interaction.client, self.match_id)
+        await interaction.followup.send("You've been signed out.", ephemeral=True)
+
+
+class FreshPugSignupView(ui.View):
+    def __init__(self, match_id):
+        super().__init__(timeout=None)
+        self.add_item(FreshPugSignupButton(match_id))
+        self.add_item(FreshPugSignOutButton(match_id))
+
+
 class FreshPugManageView(ui.View):
     def __init__(self, match_id):
+
         super().__init__(timeout=300)
         self.match_id = match_id
 
@@ -1709,12 +1947,7 @@ class FreshPugConcludeConfirmView(ui.View):
 
         if channel:
             try:
-                async for msg in channel.history(limit=200, oldest_first=True):
-                    if msg.author.id == interaction.client.user.id:
-                        try:
-                            await msg.delete()
-                        except Exception:
-                            pass
+                await channel.purge(limit=200, check=lambda m: m.author.id == interaction.client.user.id)
             except Exception:
                 pass
 
@@ -1728,8 +1961,12 @@ class FreshPugConcludeConfirmView(ui.View):
                 pass
 
         await db.end_match(self.match_id)
-        await do_archive(interaction.client, self.match_id, concluded=True)
-        await interaction.followup.send("✅ Fresh PUG concluded and archived.", ephemeral=True)
+
+        hoster_channel_id = interaction.client.config.get("hoster_channel_id")
+        fire_archive_task(interaction.client, self.match_id, concluded=True,
+                          hoster_channel_id=hoster_channel_id,
+                          triggered_by=interaction.user.id)
+        await interaction.followup.send("✅ Fresh PUG concluded. Archiving in background...", ephemeral=True)
 
     @ui.button(label="Never mind", style=discord.ButtonStyle.secondary)
     async def abort(self, interaction, button):
@@ -1749,12 +1986,7 @@ class FreshPugCancelConfirmView(ui.View):
 
         if channel:
             try:
-                async for msg in channel.history(limit=200, oldest_first=True):
-                    if msg.author.id == interaction.client.user.id:
-                        try:
-                            await msg.delete()
-                        except Exception:
-                            pass
+                await channel.purge(limit=200, check=lambda m: m.author.id == interaction.client.user.id)
             except Exception:
                 pass
 
@@ -1768,12 +2000,244 @@ class FreshPugCancelConfirmView(ui.View):
                 pass
 
         await db.end_match(self.match_id)
-        await do_archive(interaction.client, self.match_id, concluded=False)
-        await interaction.followup.send("✅ Fresh PUG cancelled.", ephemeral=True)
+
+        hoster_channel_id = interaction.client.config.get("hoster_channel_id")
+        fire_archive_task(interaction.client, self.match_id, concluded=False,
+                          hoster_channel_id=hoster_channel_id,
+                          triggered_by=interaction.user.id)
+        await interaction.followup.send("✅ Fresh PUG cancelled. Archiving in background...", ephemeral=True)
 
     @ui.button(label="Never mind", style=discord.ButtonStyle.secondary)
     async def abort(self, interaction, button):
         await interaction.response.edit_message(content="Cancellation aborted.", view=None)
+
+
+# ── Move to pending ───────────────────────────────────────────────────────────
+
+class MoveToPendingClassSelect(ui.Select):
+    """Dropdown showing classes that have accepted players."""
+    def __init__(self, match_id, accepted_by_class, is_sixs=False):
+        self.match_id = match_id
+        class_list    = SIXS_CLASSES if is_sixs else TF2_CLASSES
+        options = []
+        for cls in class_list:
+            count = len(accepted_by_class.get(cls, []))
+            if count:
+                options.append(discord.SelectOption(
+                    label=cls,
+                    value=cls,
+                    description=f"{count} accepted",
+                ))
+        if not options:
+            options = [discord.SelectOption(label="None", value="_none", description="No accepted players")]
+        super().__init__(placeholder="Select a class…", options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction):
+        class_name = self.values[0]
+        if class_name == "_none":
+            await interaction.response.edit_message(content="No accepted players.", view=None)
+            return
+        accepted = await db.get_accepted_signups_for_class(self.match_id, class_name)
+        if not accepted:
+            await interaction.response.edit_message(
+                content=f"No accepted players for **{class_name}** anymore.", view=None
+            )
+            return
+        view = MoveToPendingPlayerView(self.match_id, class_name, accepted)
+        await interaction.response.edit_message(
+            content=f"**{class_name}** — select a player to move back to pending:",
+            view=view
+        )
+
+
+class MoveToPendingPlayerButton(ui.Button):
+    def __init__(self, match_id, signup_id, username, class_name, row):
+        super().__init__(
+            label=username,
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"mtp:{match_id}:{signup_id}",
+            row=row,
+        )
+        self.match_id  = match_id
+        self.signup_id = signup_id
+        self.username  = username
+        self.class_name = class_name
+
+    async def callback(self, interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        # Move accepted signup back to pending and restore all cancelled signups
+        await db.move_accepted_to_pending(self.signup_id)
+        current = await db.get_signup_by_id(self.signup_id)
+        if current:
+            await db.restore_cancelled_to_pending(self.match_id, current["user_id"])
+
+        # Reorder remaining accepted players on this class
+        await reorder_class_roster(interaction.client, self.match_id, self.class_name)
+        await refresh_message(interaction.client, self.match_id)
+
+        await interaction.followup.send(
+            f"↩️ **{self.username}** moved back to pending for **{self.class_name}**. "
+            "Their other sign-ups have been restored.",
+            ephemeral=True
+        )
+
+        # Refresh the view to show current state
+        try:
+            accepted = await db.get_accepted_signups_for_class(self.match_id, self.class_name)
+            if accepted:
+                view = MoveToPendingPlayerView(self.match_id, self.class_name, accepted)
+                await interaction.message.edit(
+                    content=f"**{self.class_name}** — select a player to move back to pending:",
+                    view=view
+                )
+            else:
+                await interaction.message.edit(
+                    content=f"No more accepted players for **{self.class_name}**.", view=None
+                )
+        except Exception:
+            pass
+
+
+class MoveToPendingPlayerView(ui.View):
+    def __init__(self, match_id, class_name, accepted_signups):
+        super().__init__(timeout=300)
+        self.match_id   = match_id
+        self.class_name = class_name
+        row = 0
+        for i, s in enumerate(accepted_signups):
+            if i > 0 and i % 5 == 0:
+                row += 1
+            if row > 3:
+                break
+            self.add_item(MoveToPendingPlayerButton(match_id, s["id"], s["username"], class_name, row))
+
+
+class MoveToPendingView(ui.View):
+    def __init__(self, match_id):
+        super().__init__(timeout=300)
+        self.match_id = match_id
+
+    @classmethod
+    async def create(cls, match_id, is_sixs=False):
+        self    = cls(match_id)
+        accepted = await db.get_accepted_signups(match_id)
+        accepted_by_class = {}
+        for s in accepted:
+            accepted_by_class.setdefault(s["class_name"], []).append(s)
+        self.add_item(MoveToPendingClassSelect(match_id, accepted_by_class, is_sixs=is_sixs))
+        return self
+
+
+# ── Restore denied ────────────────────────────────────────────────────────────
+
+class RestoreDeniedClassSelect(ui.Select):
+    """Dropdown showing classes that have denied players."""
+    def __init__(self, match_id, denied_by_class, is_sixs=False):
+        self.match_id = match_id
+        class_list    = SIXS_CLASSES if is_sixs else TF2_CLASSES
+        options = []
+        for cls in class_list:
+            count = len(denied_by_class.get(cls, []))
+            if count:
+                options.append(discord.SelectOption(
+                    label=cls,
+                    value=cls,
+                    description=f"{count} denied",
+                ))
+        if not options:
+            options = [discord.SelectOption(label="None", value="_none", description="No denied players")]
+        super().__init__(placeholder="Select a class…", options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction):
+        class_name = self.values[0]
+        if class_name == "_none":
+            await interaction.response.edit_message(content="No denied players.", view=None)
+            return
+        signups = await db.get_signups_for_match(self.match_id)
+        denied  = [s for s in signups if s["status"] == "denied" and s["class_name"] == class_name]
+        if not denied:
+            await interaction.response.edit_message(
+                content=f"No denied players for **{class_name}** anymore.", view=None
+            )
+            return
+        view = RestoreDeniedPlayerView(self.match_id, class_name, denied)
+        await interaction.response.edit_message(
+            content=f"**{class_name}** — select a player to restore to pending:",
+            view=view
+        )
+
+
+class RestoreDeniedPlayerButton(ui.Button):
+    def __init__(self, match_id, signup_id, username, class_name, row):
+        super().__init__(
+            label=username,
+            style=discord.ButtonStyle.success,
+            custom_id=f"rden:{match_id}:{signup_id}",
+            row=row,
+        )
+        self.match_id   = match_id
+        self.signup_id  = signup_id
+        self.username   = username
+        self.class_name = class_name
+
+    async def callback(self, interaction):
+        await interaction.response.defer(ephemeral=True)
+        await db.update_signup_status(self.signup_id, "pending")
+        await refresh_message(interaction.client, self.match_id)
+
+        await interaction.followup.send(
+            f"↩️ **{self.username}** restored to pending for **{self.class_name}**.",
+            ephemeral=True
+        )
+
+        # Refresh the view
+        try:
+            signups = await db.get_signups_for_match(self.match_id)
+            denied  = [s for s in signups if s["status"] == "denied" and s["class_name"] == self.class_name]
+            if denied:
+                view = RestoreDeniedPlayerView(self.match_id, self.class_name, denied)
+                await interaction.message.edit(
+                    content=f"**{self.class_name}** — select a player to restore to pending:",
+                    view=view
+                )
+            else:
+                await interaction.message.edit(
+                    content=f"No more denied players for **{self.class_name}**.", view=None
+                )
+        except Exception:
+            pass
+
+
+class RestoreDeniedPlayerView(ui.View):
+    def __init__(self, match_id, class_name, denied_signups):
+        super().__init__(timeout=300)
+        self.match_id   = match_id
+        self.class_name = class_name
+        row = 0
+        for i, s in enumerate(denied_signups):
+            if i > 0 and i % 5 == 0:
+                row += 1
+            if row > 3:
+                break
+            self.add_item(RestoreDeniedPlayerButton(match_id, s["id"], s["username"], class_name, row))
+
+
+class RestoreDeniedView(ui.View):
+    def __init__(self, match_id):
+        super().__init__(timeout=300)
+        self.match_id = match_id
+
+    @classmethod
+    async def create(cls, match_id, is_sixs=False):
+        self    = cls(match_id)
+        signups = await db.get_signups_for_match(self.match_id)
+        denied  = [s for s in signups if s["status"] == "denied"]
+        denied_by_class = {}
+        for s in denied:
+            denied_by_class.setdefault(s["class_name"], []).append(s)
+        self.add_item(RestoreDeniedClassSelect(match_id, denied_by_class, is_sixs=is_sixs))
+        return self
 
 
 class ManageView(ui.View):
@@ -1804,6 +2268,33 @@ class ManageView(ui.View):
         text, _ = await build_manage_text(self.match_id)
         view     = await DenyReviewView.create(self.match_id)
         await interaction.response.send_message(text, view=view, ephemeral=True)
+
+    @ui.button(label="Move to pending", style=discord.ButtonStyle.secondary, row=0)
+    async def move_to_pending(self, interaction, button):
+        match   = await db.get_match(self.match_id)
+        accepted = await db.get_accepted_signups(self.match_id)
+        if not accepted:
+            await interaction.response.send_message("No accepted players right now.", ephemeral=True)
+            return
+        is_sixs    = match["type"] in ("6s_mix", "6s_opug") if match else False
+        view = await MoveToPendingView.create(self.match_id, is_sixs=is_sixs)
+        await interaction.response.send_message(
+            "Select a class to move a player back to pending:", view=view, ephemeral=True
+        )
+
+    @ui.button(label="Restore denied", style=discord.ButtonStyle.secondary, row=0)
+    async def restore_denied(self, interaction, button):
+        match   = await db.get_match(self.match_id)
+        signups = await db.get_signups_for_match(self.match_id)
+        denied  = [s for s in signups if s["status"] == "denied"]
+        if not denied:
+            await interaction.response.send_message("No denied players right now.", ephemeral=True)
+            return
+        is_sixs = match["type"] in ("6s_mix", "6s_opug") if match else False
+        view = await RestoreDeniedView.create(self.match_id, is_sixs=is_sixs)
+        await interaction.response.send_message(
+            "Select a class to restore a denied player to pending:", view=view, ephemeral=True
+        )
 
     @ui.button(label="Conclude match", style=discord.ButtonStyle.success, row=1)
     async def conclude_match(self, interaction, button):
