@@ -7,4 +7,5 @@ dependencies = [
     "aiosqlite>=0.20.0",
     "APScheduler>=3.10.4",
     "python-dateutil>=2.9.0",
+    "groq>=1.2.0",
 ]

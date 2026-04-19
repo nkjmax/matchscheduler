@@ -46,13 +46,45 @@ def start_scheduler(bot):
         matches = await db.get_matches_needing_1h_reminder()
         for match in matches:
             accepted = await db.get_accepted_signups(match["id"])
-            # Only first accepted per class = actual roster
-            seen = set()
+            match_type = match["type"]
+
+            from embeds import TF2_CLASSES, SIXS_CLASSES
+            if match_type in ("6s_mix", "6s_opug"):
+                class_order = SIXS_CLASSES
+            else:
+                class_order = TF2_CLASSES
+
             pings = []
-            for s in accepted:
-                if s["class_name"] not in seen:
-                    seen.add(s["class_name"])
-                    pings.append(f"<@{s['user_id']}>")
+            seen_users = set()
+
+            if match_type in ("mix", "6s_mix"):
+                # Main roster only — first accepted per class, in class order
+                first_per_class = {}
+                for s in accepted:
+                    if s["class_name"] not in first_per_class:
+                        first_per_class[s["class_name"]] = s
+                for cls in class_order:
+                    s = first_per_class.get(cls)
+                    if s and s["user_id"] not in seen_users:
+                        seen_users.add(s["user_id"])
+                        pings.append(f"<@{s['user_id']}>")
+            elif match_type in ("opug", "6s_opug"):
+                # All accepted players (both slots per class), in class order
+                by_class = {cls: [] for cls in class_order}
+                for s in accepted:
+                    if s["class_name"] in by_class:
+                        by_class[s["class_name"]].append(s)
+                for cls in class_order:
+                    for s in by_class[cls]:
+                        if s["user_id"] not in seen_users:
+                            seen_users.add(s["user_id"])
+                            pings.append(f"<@{s['user_id']}>")
+            elif match_type in ("fresh_pug", "6s_fresh_pug"):
+                # All signed-up players in signup order
+                for s in accepted:
+                    if s["user_id"] not in seen_users:
+                        seen_users.add(s["user_id"])
+                        pings.append(f"<@{s['user_id']}>")
 
             if not pings:
                 await db.mark_reminded(match["id"], "1h")
@@ -61,11 +93,12 @@ def start_scheduler(bot):
             channel = bot.get_channel(match["channel_id"])
             if channel:
                 try:
-                    match_type = match["type"]
                     if match_type in ("opug", "6s_opug"):
                         match_label = f"{match['division'] or 'PUG'} PUG"
                     elif match_type == "6s_mix":
                         match_label = f"{match['team_name'] or 'Mix'} vs Mix 6s"
+                    elif match_type in ("fresh_pug", "6s_fresh_pug"):
+                        match_label = "Fresh PUG" if match_type == "fresh_pug" else "Fresh PUG 6v6"
                     else:
                         match_label = f"{match['team_name'] or 'Mix'} vs Mix"
                     await channel.send(
@@ -92,7 +125,8 @@ def start_scheduler(bot):
                         match_label = f"{match['team_name'] or 'Mix'} vs Mix 6s"
                     else:
                         match_label = f"{match['team_name'] or 'Mix'} vs Mix"
-                    view = ManageView(match["id"])
+                    from views import SlimManageView
+                    view = SlimManageView(match["id"])
                     await hoster_ch.send(
                         f"<@{match['created_by']}> ⏰ It's been 8 hours since "
                         f"<#{match['channel_id']}> ({match_label}) started. "

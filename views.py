@@ -468,7 +468,7 @@ class SignOutClassPickerView(ui.View):
                     lp_warning = f"\n⚠️ You will receive the <@&{LOW_PRIORITY_ROLE_ID}> role if you fail to find replacements."
                 view = SignOutAllConfirmView(self.match_id, self.user_id)
                 await interaction.response.edit_message(
-                    content=f"⚠️ **Warning:** The match starts in less than 1 hour.{lp_warning}\nSign out of **all classes**?",
+                    content=f"⚠️ **Warning:** The match starts in less than 2 hours.{lp_warning}\nSign out of **all classes**?",
                     view=view,
                 )
             else:
@@ -487,7 +487,7 @@ class SignOutClassPickerView(ui.View):
                 lp_warning = f"\n⚠️ You will receive the <@&{LOW_PRIORITY_ROLE_ID}> role if you fail to find a replacement."
             view = SignOutConfirmView(self.match_id, self.user_id, class_name)
             await interaction.response.edit_message(
-                content=f"⚠️ **Warning:** The match starts in less than 1 hour.{lp_warning}\nSign out of **{class_name}**?",
+                content=f"⚠️ **Warning:** The match starts in less than 2 hours.{lp_warning}\nSign out of **{class_name}**?",
                 view=view,
             )
         else:
@@ -531,38 +531,72 @@ async def do_signout(client, match_id, user_id, class_name=None):
         match_label = f"{match['team_name'] or 'Mix'} vs Mix"
 
     if is_rostered:
-        next_sub = await db.get_next_accepted_for_class(match_id, class_name, user_id)
+        if is_opug:
+            # For OPUGs: cascade everyone up by one slot.
+            # The next accepted player (was slot 2 or sub) fills the vacated slot.
+            # Only ping if their status changes: sub → main roster (slot 2).
+            remaining = await db.get_accepted_signups_for_class(match_id, class_name)
+            # remaining is already re-ordered by accepted_at after the remove_signup above
+            # slot 0 = new slot 1 (already main, no ping)
+            # slot 1 = new slot 2 — only ping if they were previously a sub (index >= 2 before removal)
+            # i.e. if there are now exactly 2 accepted, the one at index 1 just moved from sub to main
+            if len(remaining) >= 2:
+                newly_main = remaining[1]  # was sub, now fills slot 2
+                # They were a sub before (were index 2+), so ping them
+                if match["thread_id"]:
+                    try:
+                        thread = client.get_channel(match["thread_id"])
+                        if thread:
+                            await thread.send(
+                                f"<@{newly_main['user_id']}> you've been moved to the "
+                                f"**{class_name}** main roster slot — the previous player signed out. ✅"
+                            )
+                    except Exception:
+                        pass
+        else:
+            # Mix: promote first sub, ping them in thread
+            next_sub = await db.get_next_accepted_for_class(match_id, class_name, user_id)
+            if next_sub:
+                await db.remove_sub_slots_for_user(match_id, next_sub["user_id"], class_name)
+                if match["thread_id"]:
+                    try:
+                        thread = client.get_channel(match["thread_id"])
+                        if thread:
+                            await thread.send(
+                                f"<@{next_sub['user_id']}> you've been moved to the "
+                                f"**{class_name}** slot on the Mix Team — the previous player signed out. ✅"
+                            )
+                    except Exception:
+                        pass
 
-        # Sub promotion — remove their other sub slots, ping in thread
-        if next_sub:
-            await db.remove_sub_slots_for_user(match_id, next_sub["user_id"], class_name)
-            if match["thread_id"]:
-                try:
-                    thread = client.get_channel(match["thread_id"])
-                    if thread:
-                        if match_type in ("opug", "6s_opug"):
-                            slot_context = f"**{class_name}** slot — the previous player signed out."
-                        else:
-                            slot_context = f"**{class_name}** slot on the Mix Team — the previous player signed out."
-                        await thread.send(
-                            f"<@{next_sub['user_id']}> you have been moved to the {slot_context}"
+                # Ping hoster in hoster channel
+                hoster_channel_id = getattr(client, "config", {}).get("hoster_channel_id")
+                if hoster_channel_id:
+                    hoster_ch = client.get_channel(int(hoster_channel_id))
+                    if hoster_ch:
+                        await hoster_ch.send(
+                            f"<@{match['created_by']}> ⚠️ **{signup['username']}** has signed out of "
+                            f"**{class_name}** in <#{match['channel_id']}> ({match_label}). "
+                            f"**{next_sub['username']}** has been moved to the main roster."
                         )
-                except Exception:
-                    pass
+            else:
+                # No sub to promote — just notify hoster
+                hoster_channel_id = getattr(client, "config", {}).get("hoster_channel_id")
+                if hoster_channel_id:
+                    hoster_ch = client.get_channel(int(hoster_channel_id))
+                    if hoster_ch:
+                        await hoster_ch.send(
+                            f"<@{match['created_by']}> ⚠️ **{signup['username']}** has signed out of "
+                            f"**{class_name}** in <#{match['channel_id']}> ({match_label})."
+                        )
 
-        # Ping hoster in hoster channel
-        hoster_channel_id = getattr(client, "config", {}).get("hoster_channel_id")
-        if hoster_channel_id:
-            hoster_ch = client.get_channel(int(hoster_channel_id))
-            if hoster_ch:
-                promoted_line = ""
-                if next_sub:
-                    promoted_line = f" **{next_sub['username']}** has been moved to the main roster."
-                await hoster_ch.send(
-                    f"<@{match['created_by']}> ⚠️ **{signup['username']}** has signed out of "
-                    f"**{class_name}** in <#{match['channel_id']}> ({match_label}).{promoted_line}"
-                )
+    elif was_accepted:
+        # Was a sub — just notify hoster silently
+        pass
 
+    # Brief yield to allow any concurrent signup insertion to complete
+    # before refresh_message reads the DB, avoiding stale message updates.
+    await asyncio.sleep(0.5)
     await refresh_message(client, match_id)
     return signup
 
@@ -598,7 +632,7 @@ class SignOutButton(ui.Button):
             return
 
         time_until = match["timestamp"] - time.time()
-        within_hour = 0 < time_until <= 3600
+        within_hour = 0 < time_until <= 7200
 
         # Determine which classes this player is on the main (first) roster slot
         rostered_classes = set()
@@ -617,7 +651,7 @@ class SignOutButton(ui.Button):
                     lp_warning = f"\n⚠️ You will receive the <@&{LOW_PRIORITY_ROLE_ID}> role if you fail to find a replacement."
                 view = SignOutConfirmView(self.match_id, interaction.user.id, class_name)
                 await interaction.followup.send(
-                    f"⚠️ **Warning:** The match starts in less than 1 hour.{lp_warning}\nAre you sure?",
+                    f"⚠️ **Warning:** The match starts in less than 2 hours.{lp_warning}\nAre you sure?",
                     view=view, ephemeral=True,
                 )
             else:
@@ -706,8 +740,10 @@ class ClassButton(ui.Button):
                     )
                     return
 
-        # Block if already signed up (non-denied) for THIS specific class
+        # Block if already signed up (non-denied, non-cancelled) for THIS specific class
         existing_class = await db.get_signup_by_user_and_class(self.match_id, interaction.user.id, self.class_name)
+        if existing_class and existing_class["status"] == "cancelled":
+            existing_class = None
         if existing_class:
             if existing_class["status"] == "denied":
                 await interaction.followup.send(
@@ -848,6 +884,8 @@ class OPugClassButton(ui.Button):
             return
 
         existing_class = await db.get_signup_by_user_and_class(self.match_id, interaction.user.id, self.class_name)
+        if existing_class and existing_class["status"] == "cancelled":
+            existing_class = None
         if existing_class:
             if existing_class["status"] == "denied":
                 await interaction.followup.send(
@@ -1158,6 +1196,11 @@ class LPConfirmView(ui.View):
         await interaction.response.defer(ephemeral=True)
         current = await db.get_signup_by_id(self.signup_id)
         already = current and current["status"] == "accepted"
+        if already:
+            await interaction.followup.send(
+                f"❌ **{self.username}** has already been accepted.", ephemeral=True
+            )
+            return
         await _do_accept(interaction, self.match_id, self.signup_id, self.username, self.class_name, self.filled, already, current)
 
     @ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
@@ -1271,6 +1314,14 @@ class AcceptPlayerButton(ui.Button):
     async def callback(self, interaction):
         current = await db.get_signup_by_id(self.signup_id)
         already = current and current["status"] == "accepted"
+
+        # Guard against double-accept (e.g. slow interaction retried by Discord)
+        if already:
+            await interaction.response.send_message(
+                f"❌ **{self.username}** has already been accepted.", ephemeral=True
+            )
+            return
+
         filled  = await db.count_accepted_for_class(self.match_id, self.class_name)
 
         # LP warning — show confirm before accepting if player has LP role
@@ -1506,6 +1557,8 @@ class SixsClassButton(ui.Button):
             await interaction.followup.send("This match has already ended.", ephemeral=True)
             return
         existing_class = await db.get_signup_by_user_and_class(self.match_id, interaction.user.id, self.class_name)
+        if existing_class and existing_class["status"] == "cancelled":
+            existing_class = None
         if existing_class:
             if existing_class["status"] == "denied":
                 await interaction.followup.send(
@@ -2066,15 +2119,32 @@ class MoveToPendingPlayerButton(ui.Button):
     async def callback(self, interaction):
         await interaction.response.defer(ephemeral=True)
 
+        # Get user_id before moving to pending
+        current = await db.get_signup_by_id(self.signup_id)
+        user_id = current["user_id"] if current else None
+
         # Move accepted signup back to pending and restore all cancelled signups
         await db.move_accepted_to_pending(self.signup_id)
-        current = await db.get_signup_by_id(self.signup_id)
         if current:
             await db.restore_cancelled_to_pending(self.match_id, current["user_id"])
 
         # Reorder remaining accepted players on this class
         await reorder_class_roster(interaction.client, self.match_id, self.class_name)
         await refresh_message(interaction.client, self.match_id)
+
+        # Ping the player in the match thread
+        if user_id:
+            match = await db.get_match(self.match_id)
+            if match and match["thread_id"]:
+                try:
+                    thread = interaction.client.get_channel(match["thread_id"])
+                    if thread:
+                        await thread.send(
+                            f"<@{user_id}> you've been moved back to pending by the hoster. "
+                            "Please wait to be re-accepted."
+                        )
+                except Exception:
+                    pass
 
         await interaction.followup.send(
             f"↩️ **{self.username}** moved back to pending for **{self.class_name}**. "
@@ -2238,6 +2308,67 @@ class RestoreDeniedView(ui.View):
             denied_by_class.setdefault(s["class_name"], []).append(s)
         self.add_item(RestoreDeniedClassSelect(match_id, denied_by_class, is_sixs=is_sixs))
         return self
+
+
+class SlimManageView(ui.View):
+    """Minimal manage view for 8h reminders — Conclude and Cancel only."""
+    def __init__(self, match_id):
+        super().__init__(timeout=None)
+        self.match_id = match_id
+
+    @ui.button(label="Conclude match", style=discord.ButtonStyle.success, row=0)
+    async def conclude_match(self, interaction, button):
+        match = await db.get_match(self.match_id)
+        if not match:
+            await interaction.response.send_message("Match not found.", ephemeral=True)
+            return
+        if time.time() < match["timestamp"]:
+            remaining = int(match["timestamp"] - time.time())
+            h, m = divmod(remaining // 60, 60)
+            await interaction.response.send_message(
+                f"❌ You can only conclude after the match has started. Starts in **{h}h {m}m**.",
+                ephemeral=True,
+            )
+            return
+        if match["type"] in ("opug", "6s_opug"):
+            split = await db.get_team_split(self.match_id)
+            if not split:
+                await interaction.response.send_message(
+                    "❌ Teams haven't been split yet. Use **Split teams** in /manage first.",
+                    ephemeral=True,
+                )
+                return
+            try:
+                teams_posted = match["teams_posted"]
+            except (IndexError, KeyError):
+                teams_posted = None
+            if not teams_posted:
+                await interaction.response.send_message(
+                    "❌ Teams have been split but not posted yet. Press **Post teams** in the balancing chat first.",
+                    ephemeral=True,
+                )
+                return
+        view = ConcludeConfirmView(self.match_id)
+        await interaction.response.send_message(
+            "Ready to conclude this match?", view=view, ephemeral=True
+        )
+
+    @ui.button(label="Cancel match", style=discord.ButtonStyle.danger, row=0)
+    async def cancel_match(self, interaction, button):
+        match = await db.get_match(self.match_id)
+        if match and match["type"] in ("opug", "6s_opug") and time.time() > match["timestamp"]:
+            view = OPugCancelAfterStartView(self.match_id)
+            await interaction.response.send_message(
+                "⚠️ This PUG has already started. If the match was played, use **Conclude** instead.\n"
+                "Are you sure you want to cancel?",
+                view=view, ephemeral=True,
+            )
+            return
+        view = CancelConfirmView(self.match_id)
+        await interaction.response.send_message(
+            "⚠️ Are you sure you want to cancel this match?",
+            view=view, ephemeral=True,
+        )
 
 
 class ManageView(ui.View):

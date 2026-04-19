@@ -71,6 +71,7 @@ async def init_db():
             ("denied_msg_id",      "INTEGER"),
             ("ping_msg_id",        "INTEGER"),
             ("signup_list_msg_id", "INTEGER"),
+            ("roster_edit_msg_id", "INTEGER"),
         ]:
             try:
                 await db.execute(f"ALTER TABLE matches ADD COLUMN {col} {definition}")
@@ -169,6 +170,11 @@ async def set_ping_msg_id(match_id, msg_id):
 async def set_signup_list_msg_id(match_id, msg_id):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE matches SET signup_list_msg_id=? WHERE id=?", (msg_id, match_id))
+        await db.commit()
+
+async def set_roster_edit_msg_id(match_id, msg_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE matches SET roster_edit_msg_id=? WHERE id=?", (msg_id, match_id))
         await db.commit()
 
 async def remove_pending_slots_for_user(match_id, user_id, keep_class):

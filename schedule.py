@@ -82,6 +82,38 @@ def parse_connect_message(text):
     return result
 
 
+def thread_name_for_match(match):
+    """Build the thread name for a match, including date."""
+    t    = match["type"]
+    date = thread_date_str(match["timestamp"])
+    div  = match["division"] or ""
+    team = match["team_name"] or "Mix"
+    if t in ("opug", "6s_opug"):
+        return f"{div} PUG — signup thread, {date}"
+    elif t == "6s_mix":
+        return f"{team} vs Mix 6s — {div}, {date}"
+    elif t in ("fresh_pug", "6s_fresh_pug"):
+        label = "FRESH PUG 6v6" if t == "6s_fresh_pug" else "FRESH PUG"
+        return f"{label}, {date}"
+    else:
+        return f"{team} vs Mix — {div}, {date}"
+
+
+def thread_date_str(unix_timestamp):
+    """Format a Unix timestamp as SGT date/time for thread names, e.g. '25 Mar 9PM'."""
+    try:
+        dt = datetime.fromtimestamp(unix_timestamp, tz=gettz(DEFAULT_TZ))
+        hour = dt.hour
+        ampm = "AM" if hour < 12 else "PM"
+        hour12 = hour % 12 or 12
+        minute = dt.minute
+        time_str = f"{hour12}:{minute:02d}{ampm}" if minute else f"{hour12}{ampm}"
+        month = dt.strftime("%b")
+        return f"{dt.day} {month} {time_str}"
+    except Exception:
+        return ""
+
+
 def is_hoster(interaction):
     role_id = interaction.client.config.get("hoster_role_id")
     if not role_id:
@@ -353,11 +385,6 @@ class EditMixModal(ui.Modal, title="Edit Match Details"):
         style=discord.TextStyle.short,
         required=False, max_length=80,
     )
-    notes_input = ui.TextInput(
-        label="Notes — blank to keep current",
-        style=discord.TextStyle.paragraph,
-        required=False, max_length=300,
-    )
 
     def __init__(self, match_id, bot):
         super().__init__()
@@ -387,8 +414,6 @@ class EditMixModal(ui.Modal, title="Edit Match Details"):
             updates["map_name"] = self.map_input.value.strip()
         if self.server_input.value.strip():
             updates["server"] = self.server_input.value.strip()
-        if self.notes_input.value.strip():
-            updates["notes"] = self.notes_input.value.strip()
 
         if not updates:
             await interaction.followup.send(
@@ -427,6 +452,15 @@ class EditMixModal(ui.Modal, title="Edit Match Details"):
                 f"⚠️ Details saved but couldn't refresh message: {e}", ephemeral=True
             )
             return
+
+        # Rename thread if timestamp or team name changed
+        if match["thread_id"] and ("timestamp" in updates or "team_name" in updates):
+            try:
+                thread = interaction.client.get_channel(match["thread_id"])
+                if thread:
+                    await thread.edit(name=thread_name_for_match(match))
+            except Exception:
+                pass
 
         await interaction.followup.send("✅ Match details updated.", ephemeral=True)
 
@@ -498,7 +532,8 @@ class EditSelectView(ui.View):
         select = ui.Select(
             placeholder="Select what to edit...",
             options=[
-                discord.SelectOption(label="Match details", value="match", description="Time, map, server, notes"),
+                discord.SelectOption(label="Match details", value="match", description="Time, map, server"),
+                discord.SelectOption(label="Division", value="division", description="Change the division"),
                 discord.SelectOption(label="Host team roster", value="roster", description="Edit a class slot"),
             ]
         )
@@ -506,13 +541,32 @@ class EditSelectView(ui.View):
         self.add_item(select)
 
     async def _on_select(self, interaction):
-        choice = interaction.data["values"][0]
-        match  = await db.get_match(self.match_id)
+        choice  = interaction.data["values"][0]
+        match   = await db.get_match(self.match_id)
         is_sixs = match["type"] in ("6s_mix", "6s_opug") if match else False
+        is_opug = match["type"] in ("opug", "6s_opug") if match else False
+
         if choice == "match":
             await interaction.response.send_modal(EditMixModal(self.match_id, self.bot))
+        elif choice == "division":
+            if is_opug:
+                await interaction.response.edit_message(
+                    content="❌ Division cannot be edited for Organised PUGs.", view=None
+                )
+                return
+            # Show division dropdown based on match type
+            if is_sixs:
+                options = [discord.SelectOption(label=d, value=d) for d in SIXS_DIVISIONS]
+            elif match["type"] == "mix":
+                options = [discord.SelectOption(label=d, value=d) for d in DIVISIONS]
+            else:
+                options = [discord.SelectOption(label=d, value=d) for d in FP_DIVISIONS]
+            view = EditDivisionView(self.match_id, self.bot, options)
+            await interaction.response.edit_message(
+                content="Select the new division:", view=view
+            )
         else:
-            if match and match["type"] in ("opug", "6s_opug"):
+            if is_opug:
                 await interaction.response.edit_message(
                     content="❌ Organised PUGs don't have a host team roster to edit.", view=None
                 )
@@ -521,6 +575,50 @@ class EditSelectView(ui.View):
             await interaction.response.edit_message(
                 content="Which class slot would you like to edit?", view=view
             )
+
+
+class EditDivisionView(ui.View):
+    def __init__(self, match_id, bot, options):
+        super().__init__(timeout=60)
+        self.match_id = match_id
+        self.bot      = bot
+        select = ui.Select(placeholder="Select division…", options=options)
+        select.callback = self._on_select
+        self.add_item(select)
+
+    async def _on_select(self, interaction):
+        await interaction.response.defer(ephemeral=True)
+        division = interaction.data["values"][0]
+        match    = await db.get_match(self.match_id)
+        if not match or match["ended"]:
+            await interaction.followup.send("❌ This match has already ended or been cancelled.", ephemeral=True)
+            return
+        await db.update_match_fields(self.match_id, division=division)
+        match   = await db.get_match(self.match_id)
+        signups = await db.get_signups_for_match(self.match_id)
+        pug_role_id = self.bot.config.get("pug_role_id")
+        try:
+            channel = interaction.client.get_channel(match["channel_id"])
+            msg     = await channel.fetch_message(match["message_id"])
+            if match["type"] == "6s_mix":
+                content = build_6s_mix_message(match, signups, pug_role_id=pug_role_id)
+            else:
+                content = build_mix_message(match, signups, pug_role_id=pug_role_id)
+            await msg.edit(content=content)
+        except Exception as e:
+            await interaction.followup.send(f"⚠️ Saved but couldn't refresh message: {e}", ephemeral=True)
+            return
+
+        # Rename thread to reflect new division
+        if match["thread_id"]:
+            try:
+                thread = interaction.client.get_channel(match["thread_id"])
+                if thread:
+                    await thread.edit(name=thread_name_for_match(match))
+            except Exception:
+                pass
+
+        await interaction.followup.send(f"✅ Division updated to **{division}**.", ephemeral=True)
 
 
 # ── Edit roster class select ──────────────────────────────────────────────────
@@ -750,7 +848,7 @@ class OPugModal(ui.Modal, title="Schedule an Organised PUG"):
 
         try:
             thread = await msg.create_thread(
-                name=f"{self.division} PUG — signup thread",
+                name=f"{self.division} PUG — signup thread, {thread_date_str(unix)}",
                 auto_archive_duration=1440,
             )
             await db.set_thread_id(match_id, thread.id)
@@ -859,7 +957,7 @@ class SixsFreshPugModal(ui.Modal, title="Schedule a 6s Fresh PUG"):
         await db.set_signup_list_msg_id(match_id, signup_list_msg.id)
 
         try:
-            thread = await msg.create_thread(name="FRESH PUG 6v6", auto_archive_duration=1440)
+            thread = await msg.create_thread(name=f"FRESH PUG 6v6, {thread_date_str(unix)}", auto_archive_duration=1440)
             await db.set_thread_id(match_id, thread.id)
         except Exception:
             pass
@@ -937,7 +1035,7 @@ class SixsOPugModal(ui.Modal, title="Schedule a 6s Organised PUG"):
         await db.set_pending_msg_id(match_id, pending_msg.id)
         await db.set_denied_msg_id(match_id, denied_msg.id)
         try:
-            thread = await msg.create_thread(name=f"{self.division} PUG — signup thread", auto_archive_duration=1440)
+            thread = await msg.create_thread(name=f"{self.division} PUG — signup thread, {thread_date_str(unix)}", auto_archive_duration=1440)
             await db.set_thread_id(match_id, thread.id)
         except Exception:
             pass
@@ -1127,7 +1225,7 @@ class FreshPugModal(ui.Modal, title="Schedule a Fresh PUG"):
 
         try:
             thread = await msg.create_thread(
-                name="FRESH PUG",
+                name=f"FRESH PUG, {thread_date_str(unix)}",
                 auto_archive_duration=1440,
             )
             await db.set_thread_id(match_id, thread.id)
@@ -1265,10 +1363,11 @@ def get_auto_ping_ids(config, match):
         return None
 
     ping_roles = config.get("ping_roles", {})
-    iron_id      = ping_roles.get("Iron")
-    steel_id     = ping_roles.get("Steel")
-    silvplat_id  = ping_roles.get("Silver/Plat")
-    pug_id       = ping_roles.get("PUG")
+    iron_id   = ping_roles.get("Iron")
+    steel_id  = ping_roles.get("Steel")
+    silver_id = ping_roles.get("Silver")
+    plat_id   = ping_roles.get("Plat")
+    pug_id    = ping_roles.get("PUG")
 
     division = (match["division"] or "").strip()
 
@@ -1278,8 +1377,10 @@ def get_auto_ping_ids(config, match):
             return [r for r in [pug_id] if r]
         elif division == "Steel":
             return [r for r in [iron_id, steel_id] if r]
-        elif division in ("Silver", "Plat"):
-            return [r for r in [silvplat_id] if r]
+        elif division == "Silver":
+            return [r for r in [silver_id] if r]
+        elif division == "Plat":
+            return [r for r in [plat_id] if r]
         return [r for r in [pug_id] if r]
 
     # OPUG division mapping
@@ -1287,8 +1388,10 @@ def get_auto_ping_ids(config, match):
         return [r for r in [iron_id, steel_id] if r]
     elif division == "Steel":
         return [r for r in [steel_id] if r]
-    elif division in ("Silver", "Plat"):
-        return [r for r in [silvplat_id] if r]
+    elif division == "Silver":
+        return [r for r in [silver_id] if r]
+    elif division == "Plat":
+        return [r for r in [plat_id] if r]
     return [r for r in [pug_id] if r]
 
 
@@ -1403,6 +1506,7 @@ class PingRoleSelectView(ui.View):
             await interaction.followup.send(f"❌ Failed to send ping: {error}", ephemeral=True)
             return
 
+        await interaction.followup.send("✅ Ping sent!", ephemeral=True)
         try:
             await interaction.message.delete()
         except Exception:
@@ -1493,6 +1597,8 @@ class ScheduleCog(commands.Cog):
             success, error = await send_ping(self.bot, match, pug_ping)
             if not success:
                 await interaction.followup.send(f"❌ Failed to send ping: {error}", ephemeral=True)
+            else:
+                await interaction.followup.send("✅ Ping sent!", ephemeral=True)
             return
 
         # Mix types — show role picker dropdown
