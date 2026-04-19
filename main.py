@@ -45,11 +45,9 @@ direct them to look for a mentor in the mentor channel instead. \
 You know this is a TF2 mix and PUG community server based in Asia. \
 If someone is rude or mean to you, roast them back without holding back. \
 Never narrate what you are about to do — never say things like "roast mode activated" or "here's my response". Just respond directly. \
+Occasionally, at random, add "noot noot" somewhere in your response. Not every time, just sometimes. \
 Keep ALL responses under 500 characters, no exceptions. Be concise and friendly. \
-ONLY mention hosting or /host if the user is EXPLICITLY asking about hosting a match. \
-If they ask anything else just answer normally. \
-If someone explicitly asks to host a match and they have the hoster role, tell them to use /host. \
-If someone explicitly asks to host a match and they dont have the hoster role, tell them only hosters can do that."""
+You know whether the user has the hoster role or not. Use this information ONLY when the user explicitly asks about hosting a match. For all other questions, ignore this information completely and just answer the question."""
 
 
 async def _reset_pingu_counter_daily():
@@ -101,10 +99,16 @@ async def pingu_reply(message, has_hoster_role):
         await message.reply("yeah? what do you want", mention_author=False)
         return
 
-    # Build messages with hoster context baked into system prompt
-    history       = _pingu_history.get(message.author.id, [])
-    role_context  = "The user you are talking to HAS the hoster role." if has_hoster_role else "The user you are talking to does NOT have the hoster role."
-    system_prompt = PINGU_SYSTEM + f"\n\n{role_context}"
+    # Only inject hoster context if the message seems hosting-related
+    history = _pingu_history.get(message.author.id, [])
+    hosting_keywords = ("host", "hosting", "schedule", "/host")
+    is_hosting_related = any(kw in content.lower() for kw in hosting_keywords)
+
+    if is_hosting_related:
+        role_context  = "The user you are talking to HAS the hoster role." if has_hoster_role else "The user you are talking to does NOT have the hoster role."
+        system_prompt = PINGU_SYSTEM + f"\n\n{role_context}"
+    else:
+        system_prompt = PINGU_SYSTEM
 
     messages = (
         [{"role": "system", "content": system_prompt}]
