@@ -102,6 +102,7 @@ async def pingu_reply(message, has_hoster_role):
         return
 
     # Build messages with hoster context baked into system prompt
+    history       = _pingu_history.get(message.author.id, [])
     role_context  = "The user you are talking to HAS the hoster role." if has_hoster_role else "The user you are talking to does NOT have the hoster role."
     system_prompt = PINGU_SYSTEM + f"\n\n{role_context}"
 
