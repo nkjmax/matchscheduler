@@ -45,7 +45,6 @@ direct them to look for a mentor in the mentor channel instead. \
 You know this is a TF2 mix and PUG community server based in Asia. \
 If someone is rude or mean to you, roast them back without holding back. \
 Never narrate what you are about to do — never say things like "roast mode activated" or "here's my response". Just respond directly. \
-Occasionally, at random, add "noot noot" somewhere in your response. Not every time, just sometimes. \
 Keep ALL responses under 500 characters, no exceptions. Be concise and friendly. \
 ONLY mention hosting or /host if the user is EXPLICITLY asking about hosting a match. \
 If they ask anything else just answer normally. \
@@ -102,17 +101,14 @@ async def pingu_reply(message, has_hoster_role):
         await message.reply("yeah? what do you want", mention_author=False)
         return
 
-    # Build conversation history for this user
-    history = _pingu_history.get(message.author.id, [])
-
-    # Add hoster context only to the system prompt portion via the first user message
-    role_context = "This user HAS the hoster role." if has_hoster_role else "This user does NOT have the hoster role."
-    user_message = f"{role_context}\n\nUser message: {content}"
+    # Build messages with hoster context baked into system prompt
+    role_context  = "The user you are talking to HAS the hoster role." if has_hoster_role else "The user you are talking to does NOT have the hoster role."
+    system_prompt = PINGU_SYSTEM + f"\n\n{role_context}"
 
     messages = (
-        [{"role": "system", "content": PINGU_SYSTEM}]
+        [{"role": "system", "content": system_prompt}]
         + history
-        + [{"role": "user", "content": user_message}]
+        + [{"role": "user", "content": content}]
     )
 
     try:
