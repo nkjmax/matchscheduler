@@ -130,16 +130,19 @@ async def pingu_reply(message, has_hoster_role):
         if len(response) > 500:
             response = response[:497] + "..."
 
+        # Strip any @everyone or @here the model might generate
+        response = response.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+
         # Update conversation history (keep last PINGU_HISTORY_LEN exchanges)
         history.append({"role": "user",      "content": content})
         history.append({"role": "assistant", "content": response})
         _pingu_history[message.author.id] = history[-(PINGU_HISTORY_LEN * 2):]
 
         _pingu_request_count += 1
-        await message.reply(response, mention_author=False)
+        await message.reply(response, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
     except Exception as e:
         log.warning(f"Pingu Groq error: {e}")
-        await message.reply("my brain broke, try again", mention_author=False)
+        await message.reply("can't talk rn, don't be clingy", mention_author=False)
 
 
 async def main():
