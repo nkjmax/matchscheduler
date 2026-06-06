@@ -149,13 +149,11 @@ def build_mix_message(match, signups, pug_role_id=None):
         class_lines(mix_starters),
         "> ",
         f"> Subs : {subs_line}",
-        "> Tag the hoster to be accepted on mix team",
         SEP,
-        "> ",
         "> :warning: **__REMINDER__**:",
         "> - Late arrivals, switching class without notifying the host, and no-shows may result in **penalties**",
         ">       - Please review https://discord.com/channels/1245647143704727644/1363089707038281898 before signing up.",
-        "> -# Thank you and enjoy the game ! 🫡",
+        ">    -  *Thank you and enjoy the game! :saluting_face:*",
     ]
 
     return "\n".join(all_lines)
@@ -688,14 +686,12 @@ def build_6s_mix_message(match, signups, pug_role_id=None):
         class_lines(mix_starters),
         "> ",
         f"> Subs : {subs_line}",
-        "> Tag the hoster to be accepted on mix team. **Ensure you specify roamer or pocket**",
         SEP,
     ] + extra_lines + [
-        "> ",
         "> :warning: **__REMINDER__**:",
         "> - Late arrivals, switching class without notifying the host, and no-shows may result in **penalties**",
         ">       - Please review https://discord.com/channels/1245647143704727644/1363089707038281898 before signing up.",
-        "> -# Thank you and enjoy the game ! 🫡",
+        ">    -  *Thank you and enjoy the game! :saluting_face:*",
     ]
     return "\n".join(all_lines)
 
