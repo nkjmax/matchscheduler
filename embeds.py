@@ -152,7 +152,7 @@ def build_mix_message(match, signups, pug_role_id=None):
         SEP,
         "> :warning: **__REMINDER__**:",
         "> - Late arrivals, switching class without notifying the host, and no-shows may result in **penalties**",
-        ">       - Please review https://discord.com/channels/1245647143704727644/1363089707038281898 before signing up.",
+        ">       - Please review https://discord.com/channels/1245647143704727644/1512763458536472728 before signing up.",
         ">    -  *Thank you and enjoy the game! :saluting_face:*",
     ]
 
@@ -690,7 +690,7 @@ def build_6s_mix_message(match, signups, pug_role_id=None):
     ] + extra_lines + [
         "> :warning: **__REMINDER__**:",
         "> - Late arrivals, switching class without notifying the host, and no-shows may result in **penalties**",
-        ">       - Please review https://discord.com/channels/1245647143704727644/1363089707038281898 before signing up.",
+        ">       - Please review https://discord.com/channels/1245647143704727644/1512763458536472728 before signing up.",
         ">    -  *Thank you and enjoy the game! :saluting_face:*",
     ]
     return "\n".join(all_lines)
